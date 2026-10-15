@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "cpu_mem.h"
 #include "reference.h"
 #include "vk_loader.h"
 
@@ -179,6 +180,7 @@ private:
     void timeline(double ms);
     bool checkRead(uint32_t pattern, const char* what);
     void peak();
+    void cpuRand();
     int summary();
 
     Options o_;
@@ -1649,14 +1651,14 @@ void Bench::peak() {
 
     // 1) Cold state: the very first GPU measurement of this process.
     log("");
-    log("[PEAK 1/7] cold state (first measurements of this process)");
+    log("[PEAK 1/8] cold state (first measurements of this process)");
     auto cold = probeLog("cold");
     double cpuCold = cpuCopyGBps();
     log("  CPU memcpy (%u threads, R+W)   : %.2f GB/s", nt, cpuCold);
 
     // 2) Does continued load raise the bandwidth?
     log("");
-    log("[PEAK 2/7] 8 s of continuous sequential reads");
+    log("[PEAK 2/8] 8 s of continuous sequential reads");
     timeline(8000);
     auto loaded = probeLog("after 8 s load");
 
@@ -1667,7 +1669,7 @@ void Bench::peak() {
             wgs.push_back(w);
     const uint32_t ths[] = {1u << 16, 1u << 18, 1u << 20};
     log("");
-    log("[PEAK 3/7] READ seq: median GB/s of 3 runs per workgroup size x invocations");
+    log("[PEAK 3/8] READ seq: median GB/s of 3 runs per workgroup size x invocations");
     log("  %8s %10s %10s %10s", "wg", "64K inv", "256K inv", "1M inv");
     Stat bestSeq;
     uint32_t seqWg = wg0, seqTh = th0;
@@ -1686,7 +1688,7 @@ void Bench::peak() {
 
     // 4) Random read (64 B): workgroup size x invocations, then access size.
     log("");
-    log("[PEAK 4/7] READ rand %u B: median GB/s of 2 runs per workgroup size x invocations", line0);
+    log("[PEAK 4/8] READ rand %u B: median GB/s of 2 runs per workgroup size x invocations", line0);
     log("  %8s %10s %10s %10s", "wg", "64K inv", "256K inv", "1M inv");
     Stat bestRand;
     uint32_t randWg = wg0, randTh = th0;
@@ -1716,7 +1718,7 @@ void Bench::peak() {
     // 5) Write / copy with the best sequential configuration, and correctness of the
     //    best configurations against the CPU.
     log("");
-    log("[PEAK 5/7] best configurations: write / copy, checked against the CPU");
+    log("[PEAK 5/8] best configurations: write / copy, checked against the CPU");
     setConfig(seqWg, seqTh, line0);
     bool seqOk = checkRead(kSeq, fmt("READ seq (wg %u, %u inv)", seqWg, seqTh).c_str());
     rows_.push_back({"READ  seq  peak", bestSeq.runs, seqOk && bestSeq.ok});
@@ -1778,7 +1780,7 @@ void Bench::peak() {
     //    process got (page size / placement), not to the clocks.
     setConfig(wg0, th0, line0);
     log("");
-    log("[PEAK 6/7] free the %llu MiB working set and allocate it again",
+    log("[PEAK 6/8] free the %llu MiB working set and allocate it again",
         (unsigned long long)(chunks_.size() * chunkBytes_ / kMiB));
     auto beforeRe = probeLog("before re-allocation");
     const size_t n = chunks_.size();
@@ -1792,7 +1794,7 @@ void Bench::peak() {
 
     // 7) Idle: does a pause bring the slow state back?
     log("");
-    log("[PEAK 7/7] 15 s idle, then measure again");
+    log("[PEAK 7/8] 15 s idle, then measure again");
     std::this_thread::sleep_for(std::chrono::seconds(15));
     auto idle = probeLog("after 15 s idle");
     double cpuEnd = cpuCopyGBps();
@@ -1829,7 +1831,187 @@ void Bench::peak() {
     if (cpuSlowCold) log("    - CPU memcpy was also slower at the start: the memory system itself was slower");
     if (!ramp && !realloc && !idleDrop && !cpuSlowCold)
         log("    - no first-run effect inside this process (cold = loaded = re-allocated within %.0f%%)", kSig);
-    log("  total peak-finder time: %.0f s", el());
+    log("  GPU peak-finder time: %.0f s", el());
+
+    // 8) The CPU on the same random read, with the best GPU random-read configuration as
+    //    the GPU reference point.
+    setConfig(randWg, randTh, line0);
+    log("");
+    log("[PEAK 8/8] CPU random read");
+    cpuRand();
+}
+
+// CPU random read: the same job as the GPU random read (data, addresses, checksum), so the
+// GPU, the CPU and the formula must all agree. The GPU working set is freed first so the
+// process does not hold it twice; nothing GPU-side can run afterwards.
+void Bench::cpuRand() {
+    const auto T0 = std::chrono::steady_clock::now();
+    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t line0 = o_.lineBytes;
+    const uint64_t bytes = chunks_.size() * chunkBytes_;
+    const uint32_t nChunks = uint32_t(chunks_.size());
+    const uint32_t seedMix = curSeedMix_;
+    std::vector<uint64_t> fps;  // footprints for the sweep, 0 = whole working set
+    for (uint64_t fp = kMiB; fp < bytes && fp <= chunkBytes_; fp *= 4) fps.push_back(fp);
+    fps.push_back(0);
+    auto fpName = [&](uint64_t fp) {
+        return fmt("%llu MiB", (unsigned long long)((fp ? fp : bytes) / kMiB));
+    };
+
+    log("");
+    log("[CPU RANDOM READ] same data, addresses and checksum as the GPU random read (%u B lines)", line0);
+    // GPU reference: whole working set, then the footprint sweep.
+    Job gj = readJob(kRand, readKey_);
+    execute(gj);
+    JobResult gr = execute(gj);
+    const double gpuGbps = jobBytes(gj) / (gr.ms() * 1e6);
+    log("  GPU (wg %u, %llu invocations): %.2f GB/s = %.1f M accesses/s, chk %08x:%08x", o_.wg,
+        (unsigned long long)threadCap_, gpuGbps, gpuGbps * 1e3 / line0, gr.chkX, gr.chkY);
+    std::vector<double> gpuFp;
+    for (uint64_t fp : fps) {
+        Job j = readJob(kRand, readKey_);
+        if (fp) {
+            j.numChunks = 1;
+            j.linesBits = log2u(fp / line0);
+            j.passes = uint32_t(std::max<uint64_t>(1, (256 * kMiB) / fp));
+            while (vecsPerChunk(j) > 0xFFFFFFFFull) j.passes /= 2;
+        }
+        Stat s = timeJob(j, jobBytes(j), 2);
+        gpuFp.push_back(s.best);
+    }
+
+    freeChunks();
+    cpu::Buffer buf;
+    buf.allocate(bytes, false);
+    auto tf = std::chrono::steady_clock::now();
+    buf.fill(seedMix, nt);
+    log("  host buffer %llu MiB (GPU working set freed), filled in %.0f ms on %u threads",
+        (unsigned long long)(bytes / kMiB),
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(), nt);
+    log("  %s", cpu::hugePageInfo().c_str());
+
+    auto makeCfg = [&](uint32_t line, uint64_t fp, unsigned threads, uint32_t pf) {
+        cpu::ReadCfg c;
+        c.vplShift = log2u(line / 16);
+        c.seedMix = seedMix;
+        c.chunkWords = uint32_t(chunkBytes_ / 4);
+        c.threads = threads;
+        c.prefetch = pf;
+        uint32_t nc = nChunks;
+        c.linesBits = log2u(chunkBytes_ / line);
+        if (fp && fp < bytes) {
+            nc = 1;
+            c.linesBits = log2u(fp / line);
+            c.passes = uint32_t(std::max<uint64_t>(1, (256 * kMiB) / fp));
+        }
+        while ((uint64_t(c.passes) << (c.linesBits + c.vplShift)) > 0xFFFFFFFFull) c.passes /= 2;
+        for (uint32_t i = 0; i < nc; ++i) {
+            std::array<uint32_t, 4> k;
+            deriveKey(readKey_, i, k.data());
+            c.keys.push_back(k);
+        }
+        return c;
+    };
+    bool allOk = true;
+    struct Res { double gbps, macc, nsPerAccess; };
+    auto runCfg = [&](const cpu::ReadCfg& c, const uint32_t exp[2]) {
+        cpu::ReadResult r = cpu::randRead(buf, c);
+        bool ok = r.chk[0] == exp[0] && r.chk[1] == exp[1];
+        if (!ok)
+            log("  CPU checksum %08x:%08x != expected %08x:%08x (%u B lines)", r.chk[0], r.chk[1], exp[0], exp[1],
+                16u << c.vplShift);
+        allOk &= ok;
+        return Res{double(r.lines) * (16u << c.vplShift) / (r.ms * 1e6), double(r.lines) / (r.ms * 1e3),
+                   r.ms * 1e6 / double(r.lines)};
+    };
+
+    // Same job as the GPU run above: CPU result == formula == GPU result.
+    uint32_t exp[2];
+    cpu::expectedChecksum(makeCfg(line0, 0, 1, 0), exp);
+    {
+        cpu::ReadCfg c = makeCfg(line0, 0, nt, 16);
+        cpu::ReadResult r = cpu::randRead(buf, c);
+        bool ok = r.chk[0] == exp[0] && r.chk[1] == exp[1] && gr.chkX == exp[0] && gr.chkY == exp[1];
+        allOk &= ok;
+        verdict(ok ? "PASS" : "FAIL", fmt("CPU random read checksum %08x:%08x %s the GPU checksum and the formula",
+                                          r.chk[0], r.chk[1], ok ? "equals" : "DIFFERS FROM"));
+    }
+
+    // Threads x software prefetch distance (the addresses do not depend on the data, so an
+    // out-of-order core overlaps misses on its own; prefetch adds more misses in flight).
+    std::vector<unsigned> tl;
+    for (unsigned t : {1u, 2u, 4u, nt})
+        if (t <= nt && std::find(tl.begin(), tl.end(), t) == tl.end()) tl.push_back(t);
+    const uint32_t pfs[] = {0u, 16u, 64u};
+    log("  %s random read, GB/s (M accesses/s):", fpName(0).c_str());
+    log("  %8s %18s %18s %18s", "threads", "no prefetch", "prefetch 16", "prefetch 64");
+    double best = 0;
+    unsigned bestT = nt;
+    uint32_t bestPf = 0;
+    for (unsigned t : tl) {
+        std::string line = fmt("  %8u", t);
+        for (uint32_t pf : pfs) {
+            Res r = runCfg(makeCfg(line0, 0, t, pf), exp);
+            line += fmt(" %9.2f (%6.1f)", r.gbps, r.macc);
+            if (r.gbps > best) { best = r.gbps; bestT = t; bestPf = pf; }
+        }
+        log("%s", line.c_str());
+    }
+    std::vector<double> runs;
+    for (int i = 0; i < 3; ++i) runs.push_back(runCfg(makeCfg(line0, 0, bestT, bestPf), exp).gbps);
+    log("  best: %u threads, prefetch %u -> median %.2f GB/s (%.1f M accesses/s) = x%.1f the GPU", bestT, bestPf,
+        median(runs), median(runs) * 1e3 / line0, median(runs) / gpuGbps);
+    rows_.push_back({fmt("CPU READ rand %uB", line0), runs, allOk});
+
+    // Access size.
+    log("  access size (%u threads, prefetch %u):", bestT, bestPf);
+    log("  %8s %10s %14s", "line", "GB/s", "M accesses/s");
+    for (uint32_t ln : {64u, 128u, 256u, 1024u, 4096u}) {
+        cpu::ReadCfg c = makeCfg(ln, 0, bestT, bestPf);
+        uint32_t e[2];
+        cpu::expectedChecksum(c, e);
+        Res r = runCfg(c, e);
+        log("  %7uB %10.2f %14.1f", ln, r.gbps, r.macc);
+    }
+
+    // Footprint: where does random access leave the caches / the TLB reach?
+    log("  footprint sweep (%u B lines), GB/s:", line0);
+    log("  %10s %10s %10s %14s", "footprint", "GPU", "CPU", "CPU latency");
+    for (size_t i = 0; i < fps.size(); ++i) {
+        cpu::ReadCfg c = makeCfg(line0, fps[i], bestT, bestPf);
+        uint32_t e[2];
+        cpu::expectedChecksum(c, e);
+        Res r = runCfg(c, e);
+        // Latency: one thread, every address depends on the previous load.
+        cpu::ReadCfg d = makeCfg(line0, fps[i], 1, 0);
+        d.dependent = true;
+        d.linesPerChunk = std::min<uint64_t>(1u << 18, uint64_t(d.passes) << d.linesBits);
+        cpu::expectedChecksum(d, e);
+        Res l = runCfg(d, e);
+        log("  %10s %10.2f %10.2f %11.1f ns", fpName(fps[i]).c_str(), gpuFp[i], r.gbps, l.nsPerAccess);
+    }
+    log("  (the smallest footprint is cache resident: its CPU number is the compute ceiling of the");
+    log("   address + checksum loop; DRAM results close to it are compute bound, not memory bound)");
+
+    // Transparent huge pages (2 MiB): fewer TLB misses if the kernel grants them.
+    buf.allocate(bytes, true);
+    buf.fill(seedMix, nt);
+    log("  with MADV_HUGEPAGE: %s", cpu::hugePageInfo().c_str());
+    {
+        Res r = runCfg(makeCfg(line0, 0, bestT, bestPf), exp);
+        cpu::ReadCfg d = makeCfg(line0, 0, 1, 0);
+        d.dependent = true;
+        d.linesPerChunk = 1u << 18;
+        uint32_t e[2];
+        cpu::expectedChecksum(d, e);
+        Res l = runCfg(d, e);
+        log("  huge-page request: %.2f GB/s (%.1f M accesses/s), latency %.1f ns", r.gbps, r.macc, l.nsPerAccess);
+    }
+    buf.release();
+    verdict(allOk ? "PASS" : "FAIL", fmt("CPU random read: every run's checksum %s the formula",
+                                         allOk ? "equals" : "DIFFERS FROM"));
+    log("  CPU random-read time: %.0f s",
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
 }
 
 int Bench::summary() {
@@ -1874,9 +2056,9 @@ int Bench::run() {
     initVulkan();
     createResources();
     log("Seed           : %u  (reproduce with --seed %u)", seed_, seed_);
-    if (!o_.peak) log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
+    if (!o_.peak && !o_.cpu) log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
         o_.warmup, o_.warmupMs);
-    if (!o_.peak && o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
+    if (!o_.peak && !o_.cpu && o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
         log("Boost          : %.0f ms %s load before the tests", o_.boostMs,
             o_.boostCpu && o_.boostGpu ? "CPU + GPU GEMM" : o_.boostCpu ? "CPU" : "GPU GEMM");
     if (o_.injectFault)
@@ -1887,8 +2069,9 @@ int Bench::run() {
     log("[INIT] filling the working set with seed-dependent pseudo-random data");
     fill(ref::hash32(seed_));
     verdict(verifyContent(curSeedMix_, "init") ? "PASS" : "FAIL", "initial memory content verified on the GPU");
-    if (o_.peak) {
-        peak();
+    if (o_.peak || o_.cpu) {
+        if (o_.peak) peak();
+        else cpuRand();
         return summary();
     }
     prewarm();
@@ -1936,7 +2119,9 @@ std::string usage() {
            "  --peak-gbps X    theoretical DRAM bandwidth, results above it fail\n"
            "  --sweep          working-set sweep from 64 KiB to the chunk size\n"
            "  --peak           peak finder: cold/loaded/re-allocated/idle bandwidth, best\n"
-           "                   workgroup size, invocations and access size (~1.5 min)\n"
+           "                   workgroup size, invocations and access size, then --cpu (~2.5 min)\n"
+           "  --cpu            CPU random read peak: same data, addresses and checksum as the\n"
+           "                   GPU; threads x prefetch, access size, footprint, latency\n"
            "  --no-checks      skip the anti-optimisation checks\n"
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
@@ -1981,6 +2166,7 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--device") { if (!next(v)) return false; o.device = int(v); }
         else if (k == "--sweep") o.sweep = true;
         else if (k == "--peak") o.peak = true;
+        else if (k == "--cpu") o.cpu = true;
         else if (k == "--no-checks") o.checks = false;
         else if (k == "--no-cpu-ref") o.cpuRef = false;
         else if (k == "--inject-fault") o.injectFault = true;

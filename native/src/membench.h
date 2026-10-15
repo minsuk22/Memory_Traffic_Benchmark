@@ -7,7 +7,7 @@
 
 namespace mb {
 
-constexpr const char* kVersion = "1.4";
+constexpr const char* kVersion = "1.5";
 
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set
@@ -29,6 +29,7 @@ struct Options {
     bool     cpuRef    = true;  // CPU reference checksum
     bool     sweep     = false; // working-set sweep (cache -> DRAM)
     bool     peak      = false; // peak finder: timeline, config search, re-allocation, idle tests
+    bool     cpu       = false; // CPU random read peak (same addresses/data/checksum as the GPU)
     double   peakGBps  = 0;     // theoretical DRAM peak, 0 = unknown
     uint32_t seed      = 0;     // 0 = random per run
     uint32_t threads   = 0;     // invocations per dispatch, 0 = auto

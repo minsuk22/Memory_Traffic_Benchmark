@@ -66,7 +66,8 @@ Options (`membench --help`):
 | `--boost-ms N` | 3000 | duration of the boost load |
 | `--peak-gbps X` | – | theoretical DRAM peak; any result above it is a FAIL (traffic did not reach DRAM) |
 | `--sweep` | off | working-set sweep 64 KiB → chunk size: shows the cache → DRAM cliff |
-| `--peak` | off | peak finder (~1.5 min, see below) instead of the normal tests |
+| `--peak` | off | peak finder (~2.5 min, see below) instead of the normal tests |
+| `--cpu` | off | CPU random read peak (see below) instead of the normal tests |
 | `--seed N` | random | reproduce a run exactly |
 | `--no-cpu-ref` | – | skip CPU reference checksums (faster, weaker) |
 | `--inject-fault` | – | self-test: kernels silently skip part of their work → the checks must FAIL |
@@ -142,11 +143,19 @@ bytes should equal the reported traffic (for 64 B lines).
      against the CPU reference,
   6. the working set is freed and allocated again in the same process (is the slow state
      tied to the memory the process got first?),
-  7. 15 s idle, probe again, CPU memcpy again.
+  7. 15 s idle, probe again, CPU memcpy again,
+  8. the CPU random read below.
 
   It ends with the peak numbers, the options that reach them (`--wg`, `--threads`) and a
   short diagnosis. Run it once after the phone has been idle and once right afterwards to
   compare a first run with a second one.
+* CPU random read (`--cpu`, app button **CPU random**): the CPU reads the *same* job as the
+  GPU random read — same data, same permuted addresses, same checksum — from a host buffer of
+  the same size (the GPU working set is freed first). Its checksum must equal the GPU's and the
+  formula's. It reports threads x software-prefetch distance, access size, a footprint sweep
+  (GPU and CPU bandwidth plus dependent-load CPU latency) and a run with `MADV_HUGEPAGE`. The
+  smallest footprint is cache resident, so its CPU number is the compute ceiling of the
+  address + checksum loop.
 
 ## 6. Results
 

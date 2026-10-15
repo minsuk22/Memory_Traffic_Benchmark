@@ -20,7 +20,7 @@ import android.widget.Toast;
  * (see `membench --help`). Output is also written to logcat with tag "membench".
  * Launch with arguments from adb:
  *   adb shell am start -n com.memtraffic.bench/.MainActivity --es args "--size-mb 1024 --sweep"
- * Without adb (e.g. devices managed by an MDM), "Peak finder" runs the --peak experiments and
+ * Without adb (e.g. devices managed by an MDM), "Peak finder" / "CPU random" run --peak / --cpu and
  * "Share log" / "Copy log" hand the complete output to any app.
  */
 public class MainActivity extends Activity {
@@ -30,7 +30,7 @@ public class MainActivity extends Activity {
 
     private TextView out;
     private ScrollView scroll;
-    private Button run, peak, share, copy;
+    private Button run, peak, cpu, share, copy;
     private EditText args;
     private final StringBuilder logText = new StringBuilder();
 
@@ -53,6 +53,7 @@ public class MainActivity extends Activity {
         LinearLayout row1 = new LinearLayout(this);
         run = button(row1, "Run benchmark", v -> start(args.getText().toString()));
         peak = button(row1, "Peak finder", v -> start(args.getText().toString() + " --peak"));
+        cpu = button(row1, "CPU random", v -> start(args.getText().toString() + " --cpu"));
         root.addView(row1);
         LinearLayout row2 = new LinearLayout(this);
         share = button(row2, "Share log", v -> shareLog());
@@ -84,6 +85,7 @@ public class MainActivity extends Activity {
     private void start(final String a) {
         run.setEnabled(false);
         peak.setEnabled(false);
+        cpu.setEnabled(false);
         out.setText("");
         logText.setLength(0);
         logText.append("device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
@@ -96,6 +98,7 @@ public class MainActivity extends Activity {
                 onLogUi("exit code " + rc);
                 run.setEnabled(true);
                 peak.setEnabled(true);
+                cpu.setEnabled(true);
             });
         }, "membench").start();
     }

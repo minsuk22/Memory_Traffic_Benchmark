@@ -81,7 +81,7 @@ endif()
 add_custom_target(membench_shaders DEPENDS ${SPV_INCS})
 
 # ---- core --------------------------------------------------------------------------
-add_library(membench_core STATIC src/membench.cpp src/vk_loader.cpp)
+add_library(membench_core STATIC src/membench.cpp src/vk_loader.cpp src/cpu_mem.cpp)
 add_dependencies(membench_core membench_shaders)
 target_include_directories(membench_core PUBLIC src PRIVATE "${GEN_DIR}")
 if(NOT ANDROID)
