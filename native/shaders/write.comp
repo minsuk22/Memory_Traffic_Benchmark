@@ -1,0 +1,34 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Random/sequential WRITE traffic. Each invocation writes the seed-dependent canonical
+// value of the address it targets. The permutation is bijective, so every uvec4 is
+// written exactly once per pass and the final memory content is fully deterministic
+// (checked afterwards by verify.comp and by a CPU-referenced read pass).
+// Also used (sequential pattern) to initialise the buffers.
+
+#include "common.glsl"
+
+layout(std430, set = 0, binding = 0) writeonly buffer Data { uvec4 data[]; };
+
+uvec4 canonical(uint vi) {
+    uint w = pc.chunkWordBase + vi * 4u;
+    return uvec4(dataValue(w), dataValue(w + 1u), dataValue(w + 2u), dataValue(w + 3u));
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint T   = pc.numThreads;
+
+    for (uint it = 0u; it < pc.itersPerThread; it += 4u) {
+        uint i0 = vecIndex((it + 0u) * T + tid, pc.keyA);
+        uint i1 = vecIndex((it + 1u) * T + tid, pc.keyA);
+        uint i2 = vecIndex((it + 2u) * T + tid, pc.keyA);
+        uint i3 = vecIndex((it + 3u) * T + tid, pc.keyA);
+        data[i0] = canonical(i0);
+        data[i1] = canonical(i1);
+        data[i2] = canonical(i2);
+        data[i3] = canonical(i3);
+    }
+
+    publish(uvec2(0u));   // only counts completed workgroups
+}

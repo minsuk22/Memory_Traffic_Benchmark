@@ -1,0 +1,32 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Random/sequential COPY traffic (read + write in flight at the same time).
+// Source = lower half of the chunk (permutation keyA), destination = upper half
+// (independent permutation keyB). Result is verified by verify.comp (mode 1).
+
+#include "common.glsl"
+
+layout(std430, set = 0, binding = 0) buffer Data { uvec4 data[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint T   = pc.numThreads;
+    uint off = pc.dstVecOffset;
+
+    for (uint it = 0u; it < pc.itersPerThread; it += 4u) {
+        uint g0 = (it + 0u) * T + tid;
+        uint g1 = (it + 1u) * T + tid;
+        uint g2 = (it + 2u) * T + tid;
+        uint g3 = (it + 3u) * T + tid;
+        uvec4 v0 = data[vecIndex(g0, pc.keyA)];
+        uvec4 v1 = data[vecIndex(g1, pc.keyA)];
+        uvec4 v2 = data[vecIndex(g2, pc.keyA)];
+        uvec4 v3 = data[vecIndex(g3, pc.keyA)];
+        data[off + vecIndex(g0, pc.keyB)] = v0;
+        data[off + vecIndex(g1, pc.keyB)] = v1;
+        data[off + vecIndex(g2, pc.keyB)] = v2;
+        data[off + vecIndex(g3, pc.keyB)] = v3;
+    }
+
+    publish(uvec2(0u));
+}

@@ -1,0 +1,30 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Untimed content verification. Counts every uvec4 that differs from what it must be.
+//   mode 0: data[vecIndex(g)]                 == canonical(vecIndex(g))      (fill / write)
+//   mode 1: data[off + vecIndex(g, keyB)]     == canonical(vecIndex(g, keyA)) (copy)
+// res.x = mismatching uvec4 count, res.y = checksum of everything inspected.
+
+#include "common.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer Data { uvec4 data[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint T   = pc.numThreads;
+    uint bad = 0u;
+    uint sum = 0u;
+
+    for (uint it = 0u; it < pc.itersPerThread; ++it) {
+        uint g   = it * T + tid;
+        uint src = vecIndex(g, pc.keyA);
+        uint dst = (pc.mode == 1u) ? pc.dstVecOffset + vecIndex(g, pc.keyB) : src;
+        uint w   = pc.chunkWordBase + src * 4u;
+        uvec4 expect = uvec4(dataValue(w), dataValue(w + 1u), dataValue(w + 2u), dataValue(w + 3u));
+        uvec4 got    = data[dst];
+        bad += any(notEqual(got, expect)) ? 1u : 0u;
+        sum += got.x ^ got.y ^ got.z ^ got.w;
+    }
+
+    publish(uvec2(bad, sum));
+}

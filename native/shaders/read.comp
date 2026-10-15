@@ -1,0 +1,38 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Random/sequential READ traffic. Every invocation computes its own pseudo-random
+// addresses from a runtime key, loads them and folds the data into a checksum.
+//
+// SINK = 0 builds the *dead-code control*: identical loop, but the result is never
+// stored. A compiler is free to delete the loads, so this variant shows how fast
+// "optimised away" work looks on this driver (it should be ~free).
+
+layout(constant_id = 1) const uint SINK = 1u;
+
+#include "common.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer Data { uvec4 data[]; };
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint T   = pc.numThreads;
+    uvec2 acc = uvec2(0u);
+
+    // 4 independent loads per iteration -> more memory-level parallelism per thread.
+    for (uint it = 0u; it < pc.itersPerThread; it += 4u) {
+        uint g0 = (it + 0u) * T + tid;
+        uint g1 = (it + 1u) * T + tid;
+        uint g2 = (it + 2u) * T + tid;
+        uint g3 = (it + 3u) * T + tid;
+        uvec4 v0 = data[vecIndex(g0, pc.keyA)];
+        uvec4 v1 = data[vecIndex(g1, pc.keyA)];
+        uvec4 v2 = data[vecIndex(g2, pc.keyA)];
+        uvec4 v3 = data[vecIndex(g3, pc.keyA)];
+        acc = mixChecksum(acc, v0, pc.logicalBase + g0);
+        acc = mixChecksum(acc, v1, pc.logicalBase + g1);
+        acc = mixChecksum(acc, v2, pc.logicalBase + g2);
+        acc = mixChecksum(acc, v3, pc.logicalBase + g3);
+    }
+
+    if (SINK != 0u) publish(acc);
+}
