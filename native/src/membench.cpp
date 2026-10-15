@@ -134,6 +134,10 @@ private:
     void initVulkan();
     void createResources();
     VkPipeline makePipeline(const uint32_t* code, size_t bytes, uint32_t sink);
+    void createPipelines();  // for the current o_.wg
+    void destroyPipelines();
+    size_t allocChunks(size_t n);  // appends up to n chunks, returns how many were allocated
+    void freeChunks();
     void printPipelineStats(VkPipeline p, const char* name);
     void destroy();
 
@@ -161,6 +165,20 @@ private:
     void testWrite(uint32_t pattern);
     void readAfterWrite();
     void sweep();
+
+    // Peak finder (--peak)
+    struct Stat {
+        double best = 0, med = 0;  // GB/s
+        bool ok = true;            // all workgroups ran
+        std::vector<double> runs;
+    };
+    void setConfig(uint32_t wg, uint32_t threads, uint32_t line);
+    Stat timeJob(const Job& j, double bytes, int reps);
+    std::pair<double, double> probeVals();  // READ seq (best of 3), READ rand (1 run) GB/s
+    double cpuCopyGBps();
+    void timeline(double ms);
+    bool checkRead(uint32_t pattern, const char* what);
+    void peak();
     int summary();
 
     Options o_;
@@ -187,6 +205,7 @@ private:
     uint32_t chunkLinesBits_ = 0;
     uint32_t vplShift_ = 0;
     uint64_t threadCap_ = 0;
+    int dataType_ = -1;
 
     VkBuffer outBuf_ = VK_NULL_HANDLE;
     VkDeviceMemory outMem_ = VK_NULL_HANDLE;
@@ -500,6 +519,7 @@ void Bench::createResources() {
     VK_CHECK(vkCreatePipelineLayout(dev_, &plci, nullptr, &pl_));
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(2 * nChunks)};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // chunks can be re-allocated
     dpci.maxSets = uint32_t(nChunks);
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &ps;
@@ -525,52 +545,9 @@ void Bench::createResources() {
     outMap_ = static_cast<volatile uint32_t*>(p);
 
     // --- data chunks -------------------------------------------------------------------
-    int dataType = -1;
-    for (uint64_t c = 0; c < nChunks; ++c) {
-        Chunk ch;
-        bci.size = chunk;
-        VK_CHECK(vkCreateBuffer(dev_, &bci, nullptr, &ch.buf));
-        vkGetBufferMemoryRequirements(dev_, ch.buf, &mr);
-        const VkMemoryPropertyFlags never =
-            VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT;
-        // Prefer plain device-local memory (no CPU-cached/snooped types).
-        dataType = pickMemType(memProps_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                               never | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-        if (dataType < 0) dataType = pickMemType(memProps_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, never);
-        if (dataType < 0) dataType = pickMemType(memProps_, mr.memoryTypeBits, 0, never);
-        if (dataType < 0) throw std::runtime_error("no usable memory type");
-        mai.allocationSize = mr.size;
-        mai.memoryTypeIndex = (uint32_t)dataType;
-        VkResult r = vkAllocateMemory(dev_, &mai, nullptr, &ch.mem);
-        if (r != VK_SUCCESS) {
-            vkDestroyBuffer(dev_, ch.buf, nullptr);
-            if (chunks_.empty()) VK_CHECK(r);
-            log("WARNING: allocation of chunk %llu failed (VkResult %d); continuing with %zu chunk(s)",
-                (unsigned long long)c, (int)r, chunks_.size());
-            break;
-        }
-        VK_CHECK(vkBindBufferMemory(dev_, ch.buf, ch.mem, 0));
-        chunks_.push_back(ch);
-    }
-
-    for (auto& ch : chunks_) {
-        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dai.descriptorPool = pool_;
-        dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &dsl_;
-        VK_CHECK(vkAllocateDescriptorSets(dev_, &dai, &ch.set));
-        VkDescriptorBufferInfo bi[2] = {{ch.buf, 0, VK_WHOLE_SIZE}, {outBuf_, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet w[2] = {};
-        for (uint32_t i = 0; i < 2; ++i) {
-            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet = ch.set;
-            w[i].dstBinding = i;
-            w[i].descriptorCount = 1;
-            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            w[i].pBufferInfo = &bi[i];
-        }
-        vkUpdateDescriptorSets(dev_, 2, w, 0, nullptr);
-    }
+    size_t got = allocChunks(nChunks);
+    if (got < nChunks)
+        log("WARNING: allocation of chunk %zu failed; continuing with %zu chunk(s)", got, got);
 
     // --- command buffer, fence, timestamps -------------------------------------------
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -591,15 +568,10 @@ void Bench::createResources() {
         VK_CHECK(vkCreateQueryPool(dev_, &qpci, nullptr, &qpool_));
     }
 
-    // --- pipelines --------------------------------------------------------------------
-    pRead_     = makePipeline(kReadSpv, sizeof kReadSpv, 1);
-    pReadDead_ = makePipeline(kReadSpv, sizeof kReadSpv, 0);
-    pWrite_    = makePipeline(kWriteSpv, sizeof kWriteSpv, 1);
-    pCopy_     = makePipeline(kCopySpv, sizeof kCopySpv, 1);
-    pVerify_   = makePipeline(kVerifySpv, sizeof kVerifySpv, 1);
+    createPipelines();
 
-    log("Data memory    : type %d [%s]", dataType,
-        memFlagsStr(memProps_.memoryTypes[dataType].propertyFlags).c_str());
+    log("Data memory    : type %d [%s]", dataType_,
+        memFlagsStr(memProps_.memoryTypes[dataType_].propertyFlags).c_str());
     log("Working set    : %llu MiB = %zu chunk(s) x %llu MiB  (requested %llu MiB)",
         (unsigned long long)(chunks_.size() * chunkBytes_ / kMiB), chunks_.size(),
         (unsigned long long)(chunkBytes_ / kMiB), (unsigned long long)o_.sizeMB);
@@ -607,6 +579,83 @@ void Bench::createResources() {
         o_.lineBytes, 1u << vplShift_, (unsigned long long)(1ull << chunkLinesBits_));
     log("Dispatch       : workgroup %u, up to %llu invocations, 4 independent loads per iteration",
         o_.wg, (unsigned long long)threadCap_);
+}
+
+size_t Bench::allocChunks(size_t n) {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = chunkBytes_;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    size_t got = 0;
+    for (; got < n; ++got) {
+        Chunk ch;
+        VK_CHECK(vkCreateBuffer(dev_, &bci, nullptr, &ch.buf));
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(dev_, ch.buf, &mr);
+        const VkMemoryPropertyFlags never =
+            VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT;
+        // Prefer plain device-local memory (no CPU-cached/snooped types).
+        int t = pickMemType(memProps_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                            never | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (t < 0) t = pickMemType(memProps_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, never);
+        if (t < 0) t = pickMemType(memProps_, mr.memoryTypeBits, 0, never);
+        if (t < 0) throw std::runtime_error("no usable memory type");
+        dataType_ = t;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = (uint32_t)t;
+        VkResult r = vkAllocateMemory(dev_, &mai, nullptr, &ch.mem);
+        if (r != VK_SUCCESS) {
+            vkDestroyBuffer(dev_, ch.buf, nullptr);
+            if (chunks_.empty()) VK_CHECK(r);
+            break;
+        }
+        VK_CHECK(vkBindBufferMemory(dev_, ch.buf, ch.mem, 0));
+
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = pool_;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &dsl_;
+        VK_CHECK(vkAllocateDescriptorSets(dev_, &dai, &ch.set));
+        VkDescriptorBufferInfo bi[2] = {{ch.buf, 0, VK_WHOLE_SIZE}, {outBuf_, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet w[2] = {};
+        for (uint32_t i = 0; i < 2; ++i) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = ch.set;
+            w[i].dstBinding = i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[i].pBufferInfo = &bi[i];
+        }
+        vkUpdateDescriptorSets(dev_, 2, w, 0, nullptr);
+        chunks_.push_back(ch);
+    }
+    return got;
+}
+
+void Bench::freeChunks() {
+    vkDeviceWaitIdle(dev_);
+    for (auto& c : chunks_) {
+        vkFreeDescriptorSets(dev_, pool_, 1, &c.set);
+        vkDestroyBuffer(dev_, c.buf, nullptr);
+        vkFreeMemory(dev_, c.mem, nullptr);
+    }
+    chunks_.clear();
+}
+
+void Bench::createPipelines() {
+    pRead_     = makePipeline(kReadSpv, sizeof kReadSpv, 1);
+    pReadDead_ = makePipeline(kReadSpv, sizeof kReadSpv, 0);
+    pWrite_    = makePipeline(kWriteSpv, sizeof kWriteSpv, 1);
+    pCopy_     = makePipeline(kCopySpv, sizeof kCopySpv, 1);
+    pVerify_   = makePipeline(kVerifySpv, sizeof kVerifySpv, 1);
+}
+
+void Bench::destroyPipelines() {
+    vkDeviceWaitIdle(dev_);
+    for (VkPipeline* p : {&pRead_, &pReadDead_, &pWrite_, &pCopy_, &pVerify_}) {
+        if (*p) vkDestroyPipeline(dev_, *p, nullptr);
+        *p = VK_NULL_HANDLE;
+    }
 }
 
 VkPipeline Bench::makePipeline(const uint32_t* code, size_t bytes, uint32_t sink) {
@@ -1484,6 +1533,305 @@ void Bench::sweep() {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Peak finder (--peak): how to get the highest bandwidth out of this device, and why the
+// first run after a pause can be slower. Runs entirely inside the app (no adb needed).
+// ---------------------------------------------------------------------------------------
+
+void Bench::setConfig(uint32_t wg, uint32_t threads, uint32_t line) {
+    if (wg != o_.wg) {
+        destroyPipelines();
+        o_.wg = wg;
+        createPipelines();
+    }
+    o_.lineBytes = line;
+    vplShift_ = log2u(line / 16);
+    chunkLinesBits_ = log2u(chunkBytes_ / line);
+    threadCap_ = std::max<uint64_t>(threads, wg);
+}
+
+// One discarded run, then `reps` timed runs (read jobs: memory is not modified).
+Bench::Stat Bench::timeJob(const Job& j0, double bytes, int reps) {
+    Stat s;
+    std::vector<double> g;
+    Job j = j0;
+    for (int i = 0; i <= reps; ++i) {
+        JobResult r = execute(j);
+        s.ok &= r.wgDone == r.wgExpected;
+        if (i) g.push_back(bytes / (r.ms() * 1e6));
+    }
+    s.best = *std::max_element(g.begin(), g.end());
+    s.med = median(g);
+    s.runs = g;
+    return s;
+}
+
+std::pair<double, double> Bench::probeVals() {
+    Job s = readJob(kSeq, 0);
+    Job r = readJob(kRand, readKey_ ^ 0x9E3779B9u);
+    double sMs = 1e300;
+    for (int i = 0; i < 3; ++i) sMs = std::min(sMs, execute(s).ms());
+    double rMs = execute(r).ms();
+    return {jobBytes(s) / (sMs * 1e6), jobBytes(r) / (rMs * 1e6)};
+}
+
+// Multi-threaded CPU memcpy over 256 MiB (counted as read + write). If this is also slow
+// in a slow run, the memory system itself (DRAM / interconnect clock) is the limit;
+// if only the GPU numbers change, it is GPU-side (GPU clock, GPU page tables / TLB).
+double Bench::cpuCopyGBps() {
+    const size_t bytes = 256 * kMiB;
+    std::vector<uint8_t> src(bytes, 1), dst(bytes, 0);  // value-initialised: pages are mapped
+    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    double best = 0;
+    for (int rep = 0; rep < 4; ++rep) {
+        src[size_t(rep) * 4096] = uint8_t(rep + 2);
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> th;
+        for (unsigned t = 0; t < nt; ++t)
+            th.emplace_back([&, t] {
+                size_t b = bytes * t / nt, e = bytes * (t + 1) / nt;
+                memcpy(dst.data() + b, src.data() + b, e - b);
+            });
+        for (auto& t : th) t.join();
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (dst[size_t(rep) * 4096] != uint8_t(rep + 2)) throw std::runtime_error("CPU memcpy check failed");
+        best = std::max(best, 2.0 * bytes / (ms * 1e6));
+    }
+    return best;
+}
+
+// Back-to-back sequential reads, reported per 1 s window: shows whether (and how fast)
+// the bandwidth ramps up while the load continues.
+void Bench::timeline(double ms) {
+    Job j = readJob(kSeq, 0);
+    const double bytes = jobBytes(j);
+    auto t0 = std::chrono::steady_clock::now();
+    auto sec = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    std::string line;
+    double winGpuMs = 0, winBytes = 0, winEnd = 1.0, lo = 1e300, hi = 0;
+    while (sec() < ms / 1000.0) {
+        winGpuMs += execute(j).ms();
+        winBytes += bytes;
+        if (sec() >= winEnd) {
+            double g = winBytes / (winGpuMs * 1e6);
+            lo = std::min(lo, g);
+            hi = std::max(hi, g);
+            line += fmt(" %.1f", g);
+            winGpuMs = winBytes = 0;
+            winEnd += 1.0;
+        }
+    }
+    log("  READ seq per second (GB/s):%s   (min %.1f, max %.1f)", line.c_str(), lo, hi);
+}
+
+// One read run with the current configuration, compared with the CPU reference.
+bool Bench::checkRead(uint32_t pattern, const char* what) {
+    Job j = readJob(pattern, readKey_ ^ 0x1234567u);
+    JobResult r = execute(j);
+    uint32_t refc[2];
+    cpuReference(j, refc);
+    bool ok = r.chkX == refc[0] && r.chkY == refc[1] && r.wgDone == r.wgExpected;
+    verdict(ok ? "PASS" : "FAIL", fmt("%s: GPU checksum %08x:%08x %s CPU reference", what, r.chkX, r.chkY,
+                                      ok ? "equals" : "DIFFERS FROM"));
+    return ok;
+}
+
+void Bench::peak() {
+    const auto T0 = std::chrono::steady_clock::now();
+    auto el = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count(); };
+    const uint32_t wg0 = o_.wg, th0 = uint32_t(threadCap_), line0 = o_.lineBytes;
+    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    auto probeLog = [&](const char* when) {
+        auto p = probeVals();
+        log("  probe %-26s: READ seq %6.2f GB/s, READ rand %5.2f GB/s   (t=%.0f s)", when, p.first, p.second, el());
+        return p;
+    };
+
+    // 1) Cold state: the very first GPU measurement of this process.
+    log("");
+    log("[PEAK 1/7] cold state (first measurements of this process)");
+    auto cold = probeLog("cold");
+    double cpuCold = cpuCopyGBps();
+    log("  CPU memcpy (%u threads, R+W)   : %.2f GB/s", nt, cpuCold);
+
+    // 2) Does continued load raise the bandwidth?
+    log("");
+    log("[PEAK 2/7] 8 s of continuous sequential reads");
+    timeline(8000);
+    auto loaded = probeLog("after 8 s load");
+
+    // 3) Sequential read: workgroup size x invocations per dispatch.
+    std::vector<uint32_t> wgs;
+    for (uint32_t w : {64u, 128u, 256u, 512u, 1024u})
+        if (w <= props_.limits.maxComputeWorkGroupInvocations && w <= props_.limits.maxComputeWorkGroupSize[0])
+            wgs.push_back(w);
+    const uint32_t ths[] = {1u << 16, 1u << 18, 1u << 20};
+    log("");
+    log("[PEAK 3/7] READ seq: median GB/s of 3 runs per workgroup size x invocations");
+    log("  %8s %10s %10s %10s", "wg", "64K inv", "256K inv", "1M inv");
+    Stat bestSeq;
+    uint32_t seqWg = wg0, seqTh = th0;
+    for (uint32_t w : wgs) {
+        std::string line = fmt("  %8u", w);
+        for (uint32_t t : ths) {
+            setConfig(w, t, line0);
+            Job j = readJob(kSeq, 0);
+            Stat s = timeJob(j, jobBytes(j), 3);
+            line += fmt(" %10.2f", s.med);
+            if (s.ok && s.med > bestSeq.med) { bestSeq = s; seqWg = w; seqTh = t; }
+        }
+        log("%s", line.c_str());
+    }
+    log("  best: wg %u, %u invocations -> median %.2f GB/s, max %.2f GB/s", seqWg, seqTh, bestSeq.med, bestSeq.best);
+
+    // 4) Random read (64 B): workgroup size x invocations, then access size.
+    log("");
+    log("[PEAK 4/7] READ rand %u B: median GB/s of 2 runs per workgroup size x invocations", line0);
+    log("  %8s %10s %10s %10s", "wg", "64K inv", "256K inv", "1M inv");
+    Stat bestRand;
+    uint32_t randWg = wg0, randTh = th0;
+    for (uint32_t w : wgs) {
+        if (w != 64 && w != 256 && w != 1024) continue;
+        std::string line = fmt("  %8u", w);
+        for (uint32_t t : ths) {
+            setConfig(w, t, line0);
+            Job j = readJob(kRand, readKey_);
+            Stat s = timeJob(j, jobBytes(j), 2);
+            line += fmt(" %10.2f", s.med);
+            if (s.ok && s.med > bestRand.med) { bestRand = s; randWg = w; randTh = t; }
+        }
+        log("%s", line.c_str());
+    }
+    log("  best: wg %u, %u invocations -> median %.2f GB/s (%.0f M accesses/s)", randWg, randTh, bestRand.med,
+        bestRand.med * 1e3 / line0);
+    log("  access size (wg %u, %u invocations):", randWg, randTh);
+    log("  %8s %10s %14s", "line", "GB/s", "M accesses/s");
+    for (uint32_t ln : {64u, 128u, 256u, 512u, 1024u, 4096u}) {
+        setConfig(randWg, randTh, ln);
+        Job j = readJob(kRand, readKey_);
+        Stat s = timeJob(j, jobBytes(j), 2);
+        log("  %7uB %10.2f %14.1f", ln, s.med, s.med * 1e3 / ln);
+    }
+
+    // 5) Write / copy with the best sequential configuration, and correctness of the
+    //    best configurations against the CPU.
+    log("");
+    log("[PEAK 5/7] best configurations: write / copy, checked against the CPU");
+    setConfig(seqWg, seqTh, line0);
+    bool seqOk = checkRead(kSeq, fmt("READ seq (wg %u, %u inv)", seqWg, seqTh).c_str());
+    rows_.push_back({"READ  seq  peak", bestSeq.runs, seqOk && bestSeq.ok});
+    {
+        Job j;
+        j.pipe = pWrite_;
+        j.linesBits = chunkLinesBits_;
+        j.pattern = kSeq;
+        j.numChunks = uint32_t(chunks_.size());
+        const double bytes = jobBytes(j);
+        std::vector<double> g;
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) {  // new data every run, verified every run
+            j.seedMix = ref::hash32(seed_ ^ (0x9E000000u + uint32_t(i)));
+            JobResult r = execute(j);
+            ok &= r.wgDone == r.wgExpected && verifyContent(j.seedMix, "peak write");
+            curSeedMix_ = j.seedMix;
+            if (i) g.push_back(bytes / (r.ms() * 1e6));
+        }
+        log("  WRITE seq : median %.2f GB/s, max %.2f GB/s, content %s", median(g),
+            *std::max_element(g.begin(), g.end()), ok ? "verified" : "WRONG");
+        verdict(ok ? "PASS" : "FAIL", "WRITE seq peak: memory content verified after every run");
+        rows_.push_back({"WRITE seq  peak", g, ok});
+    }
+    {
+        Job j;
+        j.pipe = pCopy_;
+        j.linesBits = chunkLinesBits_ - 1;
+        j.pattern = kSeq;
+        j.seedMix = curSeedMix_;
+        j.dstVecOffset = 1u << (chunkLinesBits_ - 1 + vplShift_);
+        j.numChunks = uint32_t(chunks_.size());
+        const double bytes = 2.0 * jobBytes(j);
+        std::vector<double> g;
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) {
+            j.keyBaseB = ref::hash32(seed_ ^ 0xD5D5u) + uint32_t(i);  // the copy writes a new layout each run
+            JobResult r = execute(j);
+            Job v = j;
+            v.pipe = pVerify_;
+            v.mode = 1;
+            v.unroll = 1;
+            JobResult rv = execute(v);
+            ok &= r.wgDone == r.wgExpected && rv.chkX == 0 && rv.wgDone == rv.wgExpected;
+            if (i) g.push_back(bytes / (r.ms() * 1e6));
+        }
+        log("  COPY seq  : median %.2f GB/s, max %.2f GB/s (R+W), destination %s", median(g),
+            *std::max_element(g.begin(), g.end()), ok ? "verified" : "WRONG");
+        verdict(ok ? "PASS" : "FAIL", "COPY seq peak: destination verified after every run");
+        rows_.push_back({"COPY  seq  peak", g, ok});
+        fill(curSeedMix_);
+    }
+    setConfig(randWg, randTh, line0);
+    bool randOk = checkRead(kRand, fmt("READ rand %uB (wg %u, %u inv)", line0, randWg, randTh).c_str());
+    rows_.push_back({"READ  rand peak", bestRand.runs, randOk && bestRand.ok});
+
+    // 6) Fresh allocation: free the working set and allocate it again in the same process.
+    //    If the second allocation is faster, the slow state belongs to the memory the
+    //    process got (page size / placement), not to the clocks.
+    setConfig(wg0, th0, line0);
+    log("");
+    log("[PEAK 6/7] free the %llu MiB working set and allocate it again",
+        (unsigned long long)(chunks_.size() * chunkBytes_ / kMiB));
+    auto beforeRe = probeLog("before re-allocation");
+    const size_t n = chunks_.size();
+    freeChunks();
+    size_t got = allocChunks(n);
+    if (got < n) log("  WARNING: only %zu of %zu chunks re-allocated", got, n);
+    fill(curSeedMix_);
+    verdict(verifyContent(curSeedMix_, "realloc") ? "PASS" : "FAIL", "re-allocated memory content verified");
+    auto afterRe = probeLog("after re-allocation");
+    timeline(3000);
+
+    // 7) Idle: does a pause bring the slow state back?
+    log("");
+    log("[PEAK 7/7] 15 s idle, then measure again");
+    std::this_thread::sleep_for(std::chrono::seconds(15));
+    auto idle = probeLog("after 15 s idle");
+    double cpuEnd = cpuCopyGBps();
+    log("  CPU memcpy (%u threads, R+W)   : %.2f GB/s (cold: %.2f)", nt, cpuEnd, cpuCold);
+
+    // Diagnosis
+    auto pct = [](double a, double b) { return 100.0 * (a / b - 1.0); };
+    log("");
+    log("==================================== PEAK RESULT ====================================");
+    log("  READ seq  peak : %6.2f GB/s median (max %.2f)   --wg %u --threads %u", bestSeq.med, bestSeq.best, seqWg,
+        seqTh);
+    log("  READ rand peak : %6.2f GB/s median at %u B      --wg %u --threads %u", bestRand.med, line0, randWg, randTh);
+    log("");
+    log("  READ seq / rand over time (default config wg %u, %u invocations):", wg0, th0);
+    log("    cold                 %6.2f / %5.2f", cold.first, cold.second);
+    log("    after 8 s load       %6.2f / %5.2f   (%+.0f%% / %+.0f%%)", loaded.first, loaded.second,
+        pct(loaded.first, cold.first), pct(loaded.second, cold.second));
+    log("    before re-allocation %6.2f / %5.2f", beforeRe.first, beforeRe.second);
+    log("    after re-allocation  %6.2f / %5.2f   (%+.0f%% / %+.0f%% vs before)", afterRe.first, afterRe.second,
+        pct(afterRe.first, beforeRe.first), pct(afterRe.second, beforeRe.second));
+    log("    after 15 s idle      %6.2f / %5.2f   (%+.0f%% / %+.0f%% vs after re-allocation)", idle.first,
+        idle.second, pct(idle.first, afterRe.first), pct(idle.second, afterRe.second));
+    log("    CPU memcpy           %6.2f -> %.2f GB/s (%+.0f%%)", cpuCold, cpuEnd, pct(cpuEnd, cpuCold));
+    log("");
+    const double kSig = 8.0;  // % treated as a real change
+    bool ramp = pct(loaded.first, cold.first) > kSig || pct(loaded.second, cold.second) > kSig;
+    bool realloc = pct(afterRe.first, beforeRe.first) > kSig || pct(afterRe.second, beforeRe.second) > kSig;
+    bool idleDrop = pct(idle.first, afterRe.first) < -kSig || pct(idle.second, afterRe.second) < -kSig;
+    bool cpuSlowCold = pct(cpuEnd, cpuCold) > kSig;
+    log("  diagnosis:");
+    if (ramp) log("    - bandwidth rose under continuous load: clocks ramp up (DVFS); warm up longer");
+    if (realloc) log("    - a fresh allocation is faster: the slow state belongs to the memory the process got first");
+    if (idleDrop) log("    - a 15 s pause lowers the bandwidth again: clocks drop when idle");
+    if (cpuSlowCold) log("    - CPU memcpy was also slower at the start: the memory system itself was slower");
+    if (!ramp && !realloc && !idleDrop && !cpuSlowCold)
+        log("    - no first-run effect inside this process (cold = loaded = re-allocated within %.0f%%)", kSig);
+    log("  total peak-finder time: %.0f s", el());
+}
+
 int Bench::summary() {
     log("");
     log("==================================== SUMMARY ====================================");
@@ -1526,9 +1874,9 @@ int Bench::run() {
     initVulkan();
     createResources();
     log("Seed           : %u  (reproduce with --seed %u)", seed_, seed_);
-    log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
+    if (!o_.peak) log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
         o_.warmup, o_.warmupMs);
-    if (o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
+    if (!o_.peak && o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
         log("Boost          : %.0f ms %s load before the tests", o_.boostMs,
             o_.boostCpu && o_.boostGpu ? "CPU + GPU GEMM" : o_.boostCpu ? "CPU" : "GPU GEMM");
     if (o_.injectFault)
@@ -1539,6 +1887,10 @@ int Bench::run() {
     log("[INIT] filling the working set with seed-dependent pseudo-random data");
     fill(ref::hash32(seed_));
     verdict(verifyContent(curSeedMix_, "init") ? "PASS" : "FAIL", "initial memory content verified on the GPU");
+    if (o_.peak) {
+        peak();
+        return summary();
+    }
     prewarm();
     boost();
 
@@ -1583,6 +1935,8 @@ std::string usage() {
            "  --pattern P      rand | seq | both (default both)\n"
            "  --peak-gbps X    theoretical DRAM bandwidth, results above it fail\n"
            "  --sweep          working-set sweep from 64 KiB to the chunk size\n"
+           "  --peak           peak finder: cold/loaded/re-allocated/idle bandwidth, best\n"
+           "                   workgroup size, invocations and access size (~1.5 min)\n"
            "  --no-checks      skip the anti-optimisation checks\n"
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
@@ -1626,6 +1980,7 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--wg") { if (!next(v)) return false; o.wg = uint32_t(v); }
         else if (k == "--device") { if (!next(v)) return false; o.device = int(v); }
         else if (k == "--sweep") o.sweep = true;
+        else if (k == "--peak") o.peak = true;
         else if (k == "--no-checks") o.checks = false;
         else if (k == "--no-cpu-ref") o.cpuRef = false;
         else if (k == "--inject-fault") o.injectFault = true;

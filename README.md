@@ -66,6 +66,7 @@ Options (`membench --help`):
 | `--boost-ms N` | 3000 | duration of the boost load |
 | `--peak-gbps X` | – | theoretical DRAM peak; any result above it is a FAIL (traffic did not reach DRAM) |
 | `--sweep` | off | working-set sweep 64 KiB → chunk size: shows the cache → DRAM cliff |
+| `--peak` | off | peak finder (~1.5 min, see below) instead of the normal tests |
 | `--seed N` | random | reproduce a run exactly |
 | `--no-cpu-ref` | – | skip CPU reference checksums (faster, weaker) |
 | `--inject-fault` | – | self-test: kernels silently skip part of their work → the checks must FAIL |
@@ -131,6 +132,21 @@ bytes should equal the reported traffic (for 64 B lines).
   effect on read bandwidth. On SoCs where CPU and GPU share one power budget the CPU load can
   also *lower* the GPU clocks afterwards; compare `--boost gpu`, `--boost cpu` and `--boost off`.
 * Timing uses GPU timestamps (falls back to CPU wall time when the queue has none).
+* Peak finder (`--peak`, or the **Peak finder** button in the app; needs no adb, so it also
+  works on MDM-managed phones — **Share log** / **Copy log** export the output):
+  1. cold read probe + multi-threaded CPU memcpy (first measurements of the process),
+  2. 8 s of continuous sequential reads, bandwidth per second (does it ramp up?),
+  3. READ seq over workgroup size {64..1024} x invocations {64K, 256K, 1M},
+  4. READ rand over workgroup size x invocations, then access size 64 B..4 KiB,
+  5. WRITE / COPY seq with the best configuration; best read configurations checked
+     against the CPU reference,
+  6. the working set is freed and allocated again in the same process (is the slow state
+     tied to the memory the process got first?),
+  7. 15 s idle, probe again, CPU memcpy again.
+
+  It ends with the peak numbers, the options that reach them (`--wg`, `--threads`) and a
+  short diagnosis. Run it once after the phone has been idle and once right afterwards to
+  compare a first run with a second one.
 
 ## 6. Results
 

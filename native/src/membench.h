@@ -7,7 +7,7 @@
 
 namespace mb {
 
-constexpr const char* kVersion = "1.3";
+constexpr const char* kVersion = "1.4";
 
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set
@@ -28,6 +28,7 @@ struct Options {
     bool     checks    = true;  // anti-optimisation checks
     bool     cpuRef    = true;  // CPU reference checksum
     bool     sweep     = false; // working-set sweep (cache -> DRAM)
+    bool     peak      = false; // peak finder: timeline, config search, re-allocation, idle tests
     double   peakGBps  = 0;     // theoretical DRAM peak, 0 = unknown
     uint32_t seed      = 0;     // 0 = random per run
     uint32_t threads   = 0;     // invocations per dispatch, 0 = auto

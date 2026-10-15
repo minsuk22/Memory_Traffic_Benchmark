@@ -46,6 +46,7 @@
     X(vkCreateDescriptorPool)          \
     X(vkDestroyDescriptorPool)         \
     X(vkAllocateDescriptorSets)        \
+    X(vkFreeDescriptorSets)            \
     X(vkUpdateDescriptorSets)          \
     X(vkCreateCommandPool)             \
     X(vkDestroyCommandPool)            \
