@@ -6,3 +6,4 @@ local.properties
 scripts/env.ps1
 *.iml
 .idea/
+dist/
