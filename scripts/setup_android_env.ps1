@@ -4,7 +4,8 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\setup_android_env.ps1 [-Root D:\Android]
 #
 # Installs: Temurin JDK 17, Android cmdline-tools, platform-tools (adb), platform 34,
-#           build-tools 34, NDK 26.3, CMake 3.22.1 (with ninja), Gradle 8.7 distribution.
+#           build-tools 34, NDK 28.2, CMake 3.22.1 (with ninja), Gradle 8.7 distribution,
+#           glslang (for the cooperative-matrix shaders; the NDK glslc is too old).
 param(
     [string]$Root = "D:\Android"
 )
@@ -15,7 +16,7 @@ $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is very slow with
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 $Sdk        = Join-Path $Root "sdk"
 $Downloads  = Join-Path $Root "downloads"
-$NdkVersion = "26.3.11579264"
+$NdkVersion = "28.2.13676358"
 $Packages   = @("platform-tools", "platforms;android-34", "build-tools;34.0.0",
                 "ndk;$NdkVersion", "cmake;3.22.1")
 
@@ -33,25 +34,25 @@ function Get-File($Url, $Dest) {
 $jdk = Get-ChildItem (Join-Path $Root "jdk") -Directory -ErrorAction SilentlyContinue |
        Where-Object { Test-Path (Join-Path $_.FullName "bin\java.exe") } | Select-Object -First 1
 if (-not $jdk) {
-    Write-Host "[1/5] JDK 17"
+    Write-Host "[1/6] JDK 17"
     $zip = Join-Path $Downloads "jdk17.zip"
     Get-File "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse" $zip
     Expand-Archive $zip (Join-Path $Root "jdk") -Force
     $jdk = Get-ChildItem (Join-Path $Root "jdk") -Directory | Select-Object -First 1
-} else { Write-Host "[1/5] JDK present: $($jdk.FullName)" }
+} else { Write-Host "[1/6] JDK present: $($jdk.FullName)" }
 $env:JAVA_HOME = $jdk.FullName
 
 # --- cmdline-tools --------------------------------------------------------------------
 $sdkmanager = Join-Path $Sdk "cmdline-tools\latest\bin\sdkmanager.bat"
 if (-not (Test-Path $sdkmanager)) {
-    Write-Host "[2/5] Android cmdline-tools"
+    Write-Host "[2/6] Android cmdline-tools"
     $zip = Join-Path $Downloads "cmdline-tools.zip"
     Get-File "https://dl.google.com/android/repository/commandlinetools-win-13114758_latest.zip" $zip
     $tmp = Join-Path $Sdk "cmdline-tools\_tmp"
     Expand-Archive $zip $tmp -Force
     Move-Item (Join-Path $tmp "cmdline-tools") (Join-Path $Sdk "cmdline-tools\latest")
     Remove-Item $tmp -Recurse -Force
-} else { Write-Host "[2/5] cmdline-tools present" }
+} else { Write-Host "[2/6] cmdline-tools present" }
 
 # --- SDK packages ---------------------------------------------------------------------
 $missing = @()
@@ -59,24 +60,34 @@ foreach ($p in $Packages) {
     if (-not (Test-Path (Join-Path $Sdk ($p -replace ";", "\")))) { $missing += $p }
 }
 if ($missing.Count -gt 0) {
-    Write-Host "[3/5] sdkmanager: $($missing -join ', ')"
+    Write-Host "[3/6] sdkmanager: $($missing -join ', ')"
     $yes = ("y`n" * 30)
     $yes | & $sdkmanager "--sdk_root=$Sdk" --licenses | Out-Null
     & $sdkmanager "--sdk_root=$Sdk" @missing
     if ($LASTEXITCODE -ne 0) { throw "sdkmanager failed" }
-} else { Write-Host "[3/5] SDK packages present" }
+} else { Write-Host "[3/6] SDK packages present" }
 
 # --- Gradle distribution (only used once to create the wrapper) -----------------------
 $gradle = Join-Path $Root "gradle-dist\gradle-8.7\bin\gradle.bat"
 if (-not (Test-Path $gradle)) {
-    Write-Host "[4/5] Gradle 8.7"
+    Write-Host "[4/6] Gradle 8.7"
     $zip = Join-Path $Downloads "gradle.zip"
     Get-File "https://services.gradle.org/distributions/gradle-8.7-bin.zip" $zip
     Expand-Archive $zip (Join-Path $Root "gradle-dist") -Force
-} else { Write-Host "[4/5] Gradle present" }
+} else { Write-Host "[4/6] Gradle present" }
+
+# --- glslang (GL_KHR_cooperative_matrix needs a newer compiler than the NDK's glslc) -----
+$GlslangVersion = "16.6.0"
+$glslangDir = Join-Path $Root "glslang-$GlslangVersion"
+if (-not (Test-Path (Join-Path $glslangDir "bin\glslang.exe"))) {
+    Write-Host "[5/6] glslang $GlslangVersion"
+    $zip = Join-Path $Downloads "glslang-$GlslangVersion.zip"
+    Get-File "https://github.com/KhronosGroup/glslang/releases/download/$GlslangVersion/glslang-$GlslangVersion-windows-x86_64-release.zip" $zip
+    Expand-Archive $zip $glslangDir -Force
+} else { Write-Host "[5/6] glslang present" }
 
 # --- project files --------------------------------------------------------------------
-Write-Host "[5/5] project setup"
+Write-Host "[6/6] project setup"
 $sdkEsc = ($Sdk -replace "\\", "\\")
 Set-Content -Encoding ascii (Join-Path $ProjectDir "local.properties") "sdk.dir=$sdkEsc"
 if (-not (Test-Path (Join-Path $ProjectDir "gradlew.bat"))) {
@@ -91,6 +102,7 @@ if (-not (Test-Path (Join-Path $ProjectDir "gradlew.bat"))) {
 `$env:ANDROID_HOME     = "$Sdk"
 `$env:ANDROID_SDK_ROOT = "$Sdk"
 `$env:ANDROID_NDK_HOME = "$Sdk\ndk\$NdkVersion"
+`$env:GLSLANG_DIR      = "$glslangDir\bin"
 `$env:Path = "`$env:JAVA_HOME\bin;$Sdk\platform-tools;$Sdk\cmake\3.22.1\bin;" + `$env:Path
 "@ | Set-Content -Encoding ascii (Join-Path $PSScriptRoot "env.ps1")
 

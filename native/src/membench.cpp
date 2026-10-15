@@ -32,6 +32,15 @@ const uint32_t kCopySpv[] = {
 const uint32_t kVerifySpv[] = {
 #include "verify.spv.inc"
 };
+const uint32_t kGemmTiledSpv[] = {
+#include "gemm_tiled.spv.inc"
+};
+const uint32_t kGemmCoopF32Spv[] = {
+#include "gemm_coop_f32.spv.inc"
+};
+const uint32_t kGemmCoopF16Spv[] = {
+#include "gemm_coop_f16.spv.inc"
+};
 
 // Must match the push_constant block in common.glsl (std430).
 struct Push {
@@ -140,6 +149,10 @@ private:
     void stability(const std::string& name, const std::vector<double>& gbps);
 
     void prewarm();
+    void probe(const char* when);
+    void boost();
+    void setupGemm(bool coop);
+    void destroyGemm();
     void fill(uint32_t seedMix);
     bool verifyContent(uint32_t seedMix, const char* what);
     void testRead(uint32_t pattern);
@@ -189,6 +202,28 @@ private:
     VkFence fence_ = VK_NULL_HANDLE;
     VkQueryPool qpool_ = VK_NULL_HANDLE;
 
+    // Cooperative-matrix configuration for the boost GEMM (VK_KHR_cooperative_matrix).
+    struct CoopCfg {
+        bool avail = false;    // extension + features enabled + a usable fp16 configuration
+        bool accF16 = false;   // fp16 accumulator (only if no fp32 one is offered)
+        uint32_t M = 0, N = 0, K = 0, subgroup = 0;
+    } coop_;
+    // Boost GEMM resources (n x n, created on first use).
+    struct Gemm {
+        bool coop = false;
+        VkBuffer buf[3] = {};
+        VkDeviceMemory mem[3] = {};
+        void* cMap = nullptr;
+        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+        VkPipelineLayout pl = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        VkCommandBuffer cmd[2] = {};
+        VkFence fence[2] = {};
+    } gemm_;
+    static constexpr uint32_t kGemmN = 1024;
+
     uint32_t seed_ = 0;
     uint32_t curSeedMix_ = 0;  // seed of what the memory currently holds
     uint32_t readKey_ = 0;
@@ -227,7 +262,7 @@ void Bench::initVulkan() {
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "membench";
-    app.apiVersion = VK_API_VERSION_1_1;
+    app.apiVersion = VK_API_VERSION_1_3;  // effective version = min(this, device)
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
     VK_CHECK(vkCreateInstance(&ici, nullptr, &inst_));
@@ -246,9 +281,25 @@ void Bench::initVulkan() {
     if (o_.device < 0 || (uint32_t)o_.device >= n) throw std::runtime_error("bad --device index");
     phys_ = devs[o_.device];
 
+    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> exts(n);
+    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n, exts.data());
+    auto hasExt = [&](const char* name) {
+        for (auto& e : exts)
+            if (!strcmp(e.extensionName, name)) return true;
+        return false;
+    };
+    const bool hasStatsExt = hasExt(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    const bool hasCoopExt = hasExt(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+
     VkPhysicalDeviceMaintenance3Properties m3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES};
+    VkPhysicalDeviceSubgroupProperties sgp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceCooperativeMatrixPropertiesKHR cmp{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR};
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     p2.pNext = &m3;
+    m3.pNext = &sgp;
+    if (hasCoopExt) sgp.pNext = &cmp;
     vkGetPhysicalDeviceProperties2(phys_, &p2);
     props_ = p2.properties;
     maxAlloc_ = m3.maxMemoryAllocationSize;
@@ -268,20 +319,65 @@ void Bench::initVulkan() {
     qfam_ = (uint32_t)best;
     tsBits_ = qf[best].timestampValidBits;
 
-    // Optional: driver statistics of the compiled pipelines (instruction counts etc.).
-    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n, nullptr);
-    std::vector<VkExtensionProperties> exts(n);
-    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n, exts.data());
-    bool hasStatsExt = false;
-    for (auto& e : exts)
-        if (!strcmp(e.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) hasStatsExt = true;
+    // Optional features: driver statistics of the compiled pipelines (instruction counts
+    // etc.) and cooperative matrices + fp16 for the boost GEMM (needs a Vulkan 1.2 device).
+    const bool v12 = props_.apiVersion >= VK_API_VERSION_1_2;
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pef{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
-    if (hasStatsExt) {
+    VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR fcm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    {
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        f2.pNext = &pef;
+        void** tail = &f2.pNext;
+        auto link = [&](auto* s) { *tail = s; tail = &s->pNext; };
+        if (hasStatsExt) link(&pef);
+        if (v12) { link(&f11); link(&f12); }
+        if (v12 && hasCoopExt) link(&fcm);
         vkGetPhysicalDeviceFeatures2(phys_, &f2);
-        statsExt_ = pef.pipelineExecutableInfo == VK_TRUE;
+    }
+    statsExt_ = hasStatsExt && pef.pipelineExecutableInfo;
+
+    std::string coopWhy;
+    if (!hasCoopExt) coopWhy = "VK_KHR_cooperative_matrix not supported";
+    else if (!v12) coopWhy = "Vulkan 1.2 device required";
+    else if (!fcm.cooperativeMatrix || !f12.shaderFloat16 || !f12.vulkanMemoryModel || !f11.storageBuffer16BitAccess)
+        coopWhy = "required features missing (cooperativeMatrix, shaderFloat16, vulkanMemoryModel, 16-bit storage)";
+    else if (!(cmp.cooperativeMatrixSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT))
+        coopWhy = "not supported in compute shaders";
+    else if (!vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+        coopWhy = "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR missing";
+    else {
+        // fp16 x fp16 with fp32 accumulation preferred, fp16 accumulation otherwise;
+        // 16x16x16 preferred, any tile size that divides the matrix otherwise.
+        uint32_t cnt = 0;
+        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &cnt, nullptr);
+        std::vector<VkCooperativeMatrixPropertiesKHR> cps(cnt, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &cnt, cps.data());
+        int bestScore = -1;
+        for (auto& c : cps) {
+            if (c.scope != VK_SCOPE_SUBGROUP_KHR || c.AType != VK_COMPONENT_TYPE_FLOAT16_KHR ||
+                c.BType != VK_COMPONENT_TYPE_FLOAT16_KHR || c.CType != c.ResultType)
+                continue;
+            bool f32 = c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR;
+            if (!f32 && c.CType != VK_COMPONENT_TYPE_FLOAT16_KHR) continue;
+            if (!isPow2(c.MSize) || !isPow2(c.NSize) || !isPow2(c.KSize) || 2 * c.MSize > kGemmN ||
+                2 * c.NSize > kGemmN || c.KSize > kGemmN)
+                continue;
+            int score = (f32 ? 2 : 0) + (c.MSize == 16 && c.NSize == 16 && c.KSize == 16 ? 1 : 0);
+            if (score > bestScore) {
+                bestScore = score;
+                coop_.accF16 = !f32;
+                coop_.M = c.MSize;
+                coop_.N = c.NSize;
+                coop_.K = c.KSize;
+            }
+        }
+        coop_.subgroup = sgp.subgroupSize;
+        if (bestScore < 0) coopWhy = "no fp16 subgroup configuration";
+        else if (!coop_.subgroup || coop_.subgroup > props_.limits.maxComputeWorkGroupInvocations)
+            coopWhy = "unusable subgroup size";
+        else coop_.avail = true;
     }
 
     float prio = 1.0f;
@@ -289,18 +385,36 @@ void Bench::initVulkan() {
     qci.queueFamilyIndex = qfam_;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-    const char* extNames[] = {VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME};
-    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR enable{
+    std::vector<const char*> extNames;
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR epef{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
-    enable.pipelineExecutableInfo = VK_TRUE;
+    VkPhysicalDeviceVulkan11Features e11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features e12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR ecm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    void* chain = nullptr;
+    void** tail = &chain;
+    auto link = [&](auto* s) { *tail = s; tail = &s->pNext; };
     if (statsExt_) {
-        dci.enabledExtensionCount = 1;
-        dci.ppEnabledExtensionNames = extNames;
-        dci.pNext = &enable;
+        extNames.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+        epef.pipelineExecutableInfo = VK_TRUE;
+        link(&epef);
     }
+    if (coop_.avail) {
+        extNames.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        e11.storageBuffer16BitAccess = VK_TRUE;
+        e12.shaderFloat16 = VK_TRUE;
+        e12.vulkanMemoryModel = VK_TRUE;
+        ecm.cooperativeMatrix = VK_TRUE;
+        link(&e11);
+        link(&e12);
+        link(&ecm);
+    }
+    dci.pNext = chain;
+    dci.enabledExtensionCount = uint32_t(extNames.size());
+    dci.ppEnabledExtensionNames = extNames.data();
     VK_CHECK(vkCreateDevice(phys_, &dci, nullptr, &dev_));
     if (!vkl::loadDevice(dev_, &missing)) throw std::runtime_error(fmt("missing %s", missing));
     if (!vkGetPipelineExecutablePropertiesKHR || !vkGetPipelineExecutableStatisticsKHR) statsExt_ = false;
@@ -314,6 +428,11 @@ void Bench::initVulkan() {
         props_.limits.maxStorageBufferRange / (uint32_t)kMiB, (unsigned long long)(maxAlloc_ / kMiB),
         props_.limits.maxComputeWorkGroupInvocations);
     log("Timestamps     : %u valid bits, period %.3f ns", tsBits_, props_.limits.timestampPeriod);
+    if (coop_.avail)
+        log("Matrix units   : VK_KHR_cooperative_matrix, fp16 x fp16 -> %s, %ux%ux%u tiles, subgroup %u",
+            coop_.accF16 ? "fp16" : "fp32", coop_.M, coop_.N, coop_.K, coop_.subgroup);
+    else
+        log("Matrix units   : not used (%s)", coopWhy.c_str());
     for (uint32_t i = 0; i < memProps_.memoryHeapCount; ++i)
         log("Memory heap %u  : %8llu MiB %s", i, (unsigned long long)(memProps_.memoryHeaps[i].size / kMiB),
             memProps_.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? "DEVICE_LOCAL" : "");
@@ -548,6 +667,7 @@ void Bench::printPipelineStats(VkPipeline p, const char* name) {
 
 void Bench::destroy() {
     if (dev_) {
+        destroyGemm();
         vkDeviceWaitIdle(dev_);
         for (VkPipeline p : {pRead_, pReadDead_, pWrite_, pCopy_, pVerify_})
             if (p) vkDestroyPipeline(dev_, p, nullptr);
@@ -774,6 +894,296 @@ void Bench::prewarm() {
     log("");
     log("[PRE-WARM] %d read runs, %.1f GB in %.0f ms to raise GPU/DRAM clocks (separate key, not measured)", n,
         gb, ms);
+}
+
+// Short read measurement used to see the effect of the boost on the memory clocks.
+void Bench::probe(const char* when) {
+    Job s = readJob(kSeq, 0);
+    Job r = readJob(kRand, readKey_ ^ 0x9E3779B9u);
+    double sMs = 1e300;
+    for (int i = 0; i < 3; ++i) sMs = std::min(sMs, execute(s).ms());
+    double rMs = execute(r).ms();
+    log("  probe %-12s: READ seq %6.2f GB/s, READ rand %5.2f GB/s", when, jobBytes(s) / (sMs * 1e6),
+        jobBytes(r) / (rMs * 1e6));
+}
+
+// Buffers, pipeline and command buffers for the n x n boost GEMM. A and B are filled
+// with 1.0, so every element of C must be exactly n.
+void Bench::setupGemm(bool coop) {
+    destroyGemm();
+    Gemm& g = gemm_;
+    g.coop = coop;
+    const uint64_t nn = uint64_t(kGemmN) * kGemmN;
+    const uint64_t inBytes = nn * (coop ? 2 : 4);
+    const uint64_t outBytes = nn * (coop && coop_.accF16 ? 2 : 4);
+    for (int i = 0; i < 3; ++i) {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = i < 2 ? inBytes : outBytes;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VK_CHECK(vkCreateBuffer(dev_, &bci, nullptr, &g.buf[i]));
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(dev_, g.buf[i], &mr);
+        // C is host visible so the result can be checked.
+        int t = i < 2 ? pickMemType(memProps_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)
+                      : pickMemType(memProps_, mr.memoryTypeBits,
+                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+        if (t < 0) t = pickMemType(memProps_, mr.memoryTypeBits, 0, 0);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = uint32_t(t);
+        VK_CHECK(vkAllocateMemory(dev_, &mai, nullptr, &g.mem[i]));
+        VK_CHECK(vkBindBufferMemory(dev_, g.buf[i], g.mem[i], 0));
+    }
+    VK_CHECK(vkMapMemory(dev_, g.mem[2], 0, VK_WHOLE_SIZE, 0, &g.cMap));
+
+    VkDescriptorSetLayoutBinding b[3] = {};
+    for (uint32_t i = 0; i < 3; ++i) {
+        b[i].binding = i;
+        b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dl.bindingCount = 3;
+    dl.pBindings = b;
+    VK_CHECK(vkCreateDescriptorSetLayout(dev_, &dl, nullptr, &g.dsl));
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 4};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &g.dsl;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
+    VK_CHECK(vkCreatePipelineLayout(dev_, &plci, nullptr, &g.pl));
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = 1;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &ps;
+    VK_CHECK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &g.pool));
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = g.pool;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &g.dsl;
+    VK_CHECK(vkAllocateDescriptorSets(dev_, &dai, &g.set));
+    VkDescriptorBufferInfo bi[3];
+    VkWriteDescriptorSet w[3] = {};
+    for (uint32_t i = 0; i < 3; ++i) {
+        bi[i] = {g.buf[i], 0, VK_WHOLE_SIZE};
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet = g.set;
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[i].pBufferInfo = &bi[i];
+    }
+    vkUpdateDescriptorSets(dev_, 3, w, 0, nullptr);
+
+    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    if (coop) {
+        smci.codeSize = coop_.accF16 ? sizeof kGemmCoopF16Spv : sizeof kGemmCoopF32Spv;
+        smci.pCode = coop_.accF16 ? kGemmCoopF16Spv : kGemmCoopF32Spv;
+    } else {
+        smci.codeSize = sizeof kGemmTiledSpv;
+        smci.pCode = kGemmTiledSpv;
+    }
+    VkShaderModule sm;
+    VK_CHECK(vkCreateShaderModule(dev_, &smci, nullptr, &sm));
+    uint32_t spec[4] = {coop_.subgroup, coop_.M, coop_.N, coop_.K};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
+    VkSpecializationInfo si{4, me, sizeof spec, spec};
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = sm;
+    cpi.stage.pName = "main";
+    cpi.stage.pSpecializationInfo = coop ? &si : nullptr;
+    cpi.layout = g.pl;
+    VkResult r = vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpi, nullptr, &g.pipe);
+    vkDestroyShaderModule(dev_, sm, nullptr);
+    VK_CHECK(r);
+
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = cmdPool_;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 2;
+    VK_CHECK(vkAllocateCommandBuffers(dev_, &cbai, g.cmd));
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    for (auto& f : g.fence) VK_CHECK(vkCreateFence(dev_, &fci, nullptr, &f));
+}
+
+void Bench::destroyGemm() {
+    Gemm& g = gemm_;
+    if (!dev_) return;
+    vkDeviceWaitIdle(dev_);
+    for (auto& f : g.fence)
+        if (f) vkDestroyFence(dev_, f, nullptr);
+    if (g.cmd[0]) vkFreeCommandBuffers(dev_, cmdPool_, 2, g.cmd);
+    if (g.pipe) vkDestroyPipeline(dev_, g.pipe, nullptr);
+    if (g.pool) vkDestroyDescriptorPool(dev_, g.pool, nullptr);
+    if (g.pl) vkDestroyPipelineLayout(dev_, g.pl, nullptr);
+    if (g.dsl) vkDestroyDescriptorSetLayout(dev_, g.dsl, nullptr);
+    for (int i = 0; i < 3; ++i) {
+        if (g.buf[i]) vkDestroyBuffer(dev_, g.buf[i], nullptr);
+        if (g.mem[i]) vkFreeMemory(dev_, g.mem[i], nullptr);
+    }
+    g = Gemm{};
+}
+
+// Loads CPU and GPU right before the measurements so that DVFS raises the CPU, GPU and
+// memory-interface clocks: all CPU cores run integer hashing, the GPU runs back-to-back
+// 1024^3 GEMMs (matrix units via VK_KHR_cooperative_matrix when available). The probes
+// before and after show whether this changes the memory bandwidth.
+void Bench::boost() {
+    if (o_.boostMs <= 0 || (!o_.boostCpu && !o_.boostGpu)) return;
+    log("");
+    log("[BOOST] %.0f ms of %s load right before the tests", o_.boostMs,
+        o_.boostCpu && o_.boostGpu ? "CPU + GPU" : o_.boostCpu ? "CPU" : "GPU");
+    probe("before boost");
+
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> cpuHashes{0};
+    std::vector<std::thread> th;
+    struct Joiner {  // stops the CPU load also when the GPU part throws
+        std::atomic<bool>& stop;
+        std::vector<std::thread>& th;
+        ~Joiner() {
+            stop = true;
+            for (auto& t : th)
+                if (t.joinable()) t.join();
+        }
+    } joiner{stop, th};
+    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    if (o_.boostCpu)
+        for (unsigned t = 0; t < nt; ++t)
+            th.emplace_back([&, t] {
+                uint32_t x = t + 1;
+                uint64_t cnt = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    for (int i = 0; i < 4096; ++i) x = ref::hash32(x);
+                    cnt += 4096;
+                }
+                cpuHashes += cnt + (x == 0);  // keep x alive
+            });
+
+    auto t0 = std::chrono::steady_clock::now();
+    auto elapsedMs = [&] {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    std::string gpuLine;
+    if (o_.boostGpu) {
+        bool coop = coop_.avail;
+        for (;;) {
+            try {
+                setupGemm(coop);
+                break;
+            } catch (const std::exception& e) {
+                if (!coop) throw;
+                log("  cooperative-matrix GEMM unavailable (%s), using the fp32 shader GEMM", e.what());
+                coop = false;
+            }
+        }
+        Gemm& g = gemm_;
+        const uint32_t n = kGemmN;
+        const uint32_t groupsX = coop ? (n / (2 * coop_.M)) * (n / (2 * coop_.N)) : n / 16;
+        const uint32_t groupsY = coop ? 1 : n / 16;
+        auto record = [&](VkCommandBuffer cb, uint32_t count, bool init) {
+            VK_CHECK(vkResetCommandBuffer(cb, 0));
+            VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            VK_CHECK(vkBeginCommandBuffer(cb, &cbi));
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            if (init) {
+                const uint32_t one = coop ? 0x3C003C00u : 0x3F800000u;  // 1.0 in fp16 pairs / fp32
+                vkCmdFillBuffer(cb, g.buf[0], 0, VK_WHOLE_SIZE, one);
+                vkCmdFillBuffer(cb, g.buf[1], 0, VK_WHOLE_SIZE, one);
+                vkCmdFillBuffer(cb, g.buf[2], 0, VK_WHOLE_SIZE, 0);
+                mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                     &mb, 0, nullptr, 0, nullptr);
+            }
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.set, 0, nullptr);
+            vkCmdPushConstants(cb, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &n);
+            for (uint32_t i = 0; i < count; ++i) {
+                vkCmdDispatch(cb, groupsX, groupsY, 1);
+                mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                mb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     0, 1, &mb, 0, nullptr, 0, nullptr);
+            }
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
+                                 nullptr, 0, nullptr);
+            VK_CHECK(vkEndCommandBuffer(cb));
+        };
+        auto submit = [&](int i) {
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &g.cmd[i];
+            VK_CHECK(vkResetFences(dev_, 1, &g.fence[i]));
+            VK_CHECK(vkQueueSubmit(queue_, 1, &si, g.fence[i]));
+        };
+        auto wait = [&](int i) { VK_CHECK(vkWaitForFences(dev_, 1, &g.fence[i], VK_TRUE, ~0ull)); };
+
+        // One GEMM (plus buffer init) to size the batches to ~40 ms per submission.
+        record(g.cmd[0], 1, true);
+        auto s0 = std::chrono::steady_clock::now();
+        submit(0);
+        wait(0);
+        double oneMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+        uint32_t batch = uint32_t(std::clamp(40.0 / std::max(oneMs, 0.01), 1.0, 256.0));
+        record(g.cmd[0], batch, false);
+        record(g.cmd[1], batch, false);
+
+        // Two submissions in flight, so the GPU never waits for the CPU.
+        uint64_t gemms = 1;
+        auto g0 = std::chrono::steady_clock::now();
+        submit(0);
+        submit(1);
+        int cur = 0;
+        while (elapsedMs() < o_.boostMs) {
+            wait(cur);
+            gemms += batch;
+            submit(cur);
+            cur ^= 1;
+        }
+        wait(0);
+        wait(1);
+        gemms += 2ull * batch;
+        double gMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count();
+        double tflops = double(gemms - 1) * 2.0 * n * n * n / (gMs * 1e9);
+
+        // Every element of C must be n (A = B = 1.0).
+        uint64_t bad = 0;
+        const uint64_t nn = uint64_t(n) * n;
+        if (coop && coop_.accF16) {
+            const uint16_t* c = static_cast<const uint16_t*>(g.cMap);
+            for (uint64_t i = 0; i < nn; ++i) bad += c[i] != 0x6400;  // 1024.0 in fp16
+        } else {
+            const float* c = static_cast<const float*>(g.cMap);
+            for (uint64_t i = 0; i < nn; ++i) bad += c[i] != float(n);
+        }
+        gpuLine = fmt("%s GEMM %ux%ux%u: %llu GEMMs (%u per submission), %.2f TFLOPS, result %s",
+                      coop ? (coop_.accF16 ? "coopmat fp16->fp16" : "coopmat fp16->fp32") : "fp32 shader", n, n, n,
+                      (unsigned long long)gemms, batch, tflops,
+                      bad ? fmt("WRONG (%llu of %llu elements)", (unsigned long long)bad, (unsigned long long)nn).c_str()
+                          : "correct");
+        destroyGemm();
+        if (bad)
+            verdict("WARN", "boost GEMM produced a wrong result (driver issue?); it is only used as load, the "
+                            "memory results are not affected");
+    } else {
+        while (elapsedMs() < o_.boostMs) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    stop = true;
+    for (auto& t : th) t.join();
+    th.clear();
+    double ms = elapsedMs();
+    if (o_.boostGpu) log("  GPU: %s", gpuLine.c_str());
+    if (o_.boostCpu) log("  CPU: %u threads, %.0f M hashes/s", nt, double(cpuHashes.load()) / (ms * 1e3));
+    log("  boost took %.0f ms", ms);
+    probe("after boost");
 }
 
 void Bench::fill(uint32_t seedMix) {
@@ -1118,6 +1528,9 @@ int Bench::run() {
     log("Seed           : %u  (reproduce with --seed %u)", seed_, seed_);
     log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
         o_.warmup, o_.warmupMs);
+    if (o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
+        log("Boost          : %.0f ms %s load before the tests", o_.boostMs,
+            o_.boostCpu && o_.boostGpu ? "CPU + GPU GEMM" : o_.boostCpu ? "CPU" : "GPU GEMM");
     if (o_.injectFault)
         log("*** --inject-fault: every timed kernel silently skips part of its work - checks MUST fail ***");
     readKey_ = ref::hash32(seed_ ^ 0x52454144u);
@@ -1127,6 +1540,7 @@ int Bench::run() {
     fill(ref::hash32(seed_));
     verdict(verifyContent(curSeedMix_, "init") ? "PASS" : "FAIL", "initial memory content verified on the GPU");
     prewarm();
+    boost();
 
     std::vector<uint32_t> pats;
     if (o_.patRand) pats.push_back(kRand);
@@ -1162,6 +1576,9 @@ std::string usage() {
            "  --warmup N       minimum warm-up repetitions per test (default 2)\n"
            "  --warmup-ms N    minimum warm-up GPU time per test (default 500)\n"
            "  --prewarm-ms N   GPU load before the first test, 0 = off (default 2000)\n"
+           "  --boost MODE     cpu | gpu | both | off: load right before the tests to raise\n"
+           "                   the clocks; gpu = 1024^3 GEMM on the matrix units (default both)\n"
+           "  --boost-ms N     duration of the boost load (default 3000)\n"
            "  --tests LIST     comma list of read,write,copy (default all)\n"
            "  --pattern P      rand | seq | both (default both)\n"
            "  --peak-gbps X    theoretical DRAM bandwidth, results above it fail\n"
@@ -1195,6 +1612,15 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--warmup") { if (!next(v)) return false; o.warmup = int(v); }
         else if (k == "--warmup-ms") { if (!next(v)) return false; o.warmupMs = double(v); }
         else if (k == "--prewarm-ms") { if (!next(v)) return false; o.prewarmMs = double(v); }
+        else if (k == "--boost-ms") { if (!next(v)) return false; o.boostMs = double(v); }
+        else if (k == "--boost") {
+            if (i + 1 >= a.size()) { err = "missing value for --boost"; return false; }
+            std::string m = a[++i];
+            o.boostCpu = m == "cpu" || m == "both";
+            o.boostGpu = m == "gpu" || m == "both";
+            if (m == "off") o.boostMs = 0;
+            else if (!o.boostCpu && !o.boostGpu) { err = "--boost must be cpu, gpu, both or off"; return false; }
+        }
         else if (k == "--seed") { if (!next(v)) return false; o.seed = uint32_t(v); }
         else if (k == "--threads") { if (!next(v)) return false; o.threads = uint32_t(v); }
         else if (k == "--wg") { if (!next(v)) return false; o.wg = uint32_t(v); }

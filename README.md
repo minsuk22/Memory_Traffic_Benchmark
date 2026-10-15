@@ -27,7 +27,9 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_android_env.ps1      # -R
 ```
 
 Installs without admin rights into `D:\Android`: Temurin JDK 17, Android cmdline-tools,
-platform-tools (adb), platform 34, build-tools 34, **NDK 26.3.11579264** (includes `glslc`),
+platform-tools (adb), platform 34, build-tools 34, **NDK 28.2.13676358** (includes `glslc`),
+glslang 16.6.0 (the cooperative-matrix shaders need a newer compiler than the NDK `glslc`;
+without it the committed `native/shaders/prebuilt/*.spv.inc` are used),
 CMake 3.22.1 + Ninja, and Gradle 8.7. It also writes `local.properties`, the Gradle wrapper and
 `scripts\env.ps1`. Already installed components are skipped.
 
@@ -60,6 +62,8 @@ Options (`membench --help`):
 | `--reps / --warmup` | 5 / 2 | measured / minimum discarded repetitions per test |
 | `--warmup-ms N` | 500 | warm-up also lasts at least this much GPU time per test |
 | `--prewarm-ms N` | 2000 | GPU/DRAM load before the first test so the clocks ramp up (0 = off) |
+| `--boost MODE` | both | `cpu`, `gpu`, `both` or `off`: load right before the tests to raise the DVFS clocks; `gpu` runs 1024³ GEMMs on the matrix units (`VK_KHR_cooperative_matrix`, fp32 shader GEMM as fallback) |
+| `--boost-ms N` | 3000 | duration of the boost load |
 | `--peak-gbps X` | – | theoretical DRAM peak; any result above it is a FAIL (traffic did not reach DRAM) |
 | `--sweep` | off | working-set sweep 64 KiB → chunk size: shows the cache → DRAM cliff |
 | `--seed N` | random | reproduce a run exactly |
@@ -120,6 +124,12 @@ bytes should equal the reported traffic (for 64 B lines).
   computed during the warm-up so the GPU never idles before the measured runs. Warm-up cannot
   leave useful data in the caches: each run touches the whole set (>> cache size) once, so at
   most a few MiB of the last run survive. A run-to-run spread above 10 % gives a WARN.
+* Boost: after the pre-warm, all CPU cores run integer hashing and the GPU runs back-to-back
+  1024³ GEMMs (fp16 on the matrix units via `VK_KHR_cooperative_matrix`, else an fp32 shader
+  GEMM; the result is checked) for 3 s, so DVFS governors that follow CPU/GPU load raise the
+  memory-interface clocks. `probe before boost` / `probe after boost` in the log show the
+  effect on read bandwidth. On SoCs where CPU and GPU share one power budget the CPU load can
+  also *lower* the GPU clocks afterwards; compare `--boost gpu`, `--boost cpu` and `--boost off`.
 * Timing uses GPU timestamps (falls back to CPU wall time when the queue has none).
 
 ## 6. Results

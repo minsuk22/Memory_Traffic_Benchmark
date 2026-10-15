@@ -50,6 +50,7 @@
     X(vkCreateCommandPool)             \
     X(vkDestroyCommandPool)            \
     X(vkAllocateCommandBuffers)        \
+    X(vkFreeCommandBuffers)            \
     X(vkResetCommandBuffer)            \
     X(vkBeginCommandBuffer)            \
     X(vkEndCommandBuffer)              \
@@ -57,6 +58,7 @@
     X(vkCmdBindDescriptorSets)         \
     X(vkCmdPushConstants)              \
     X(vkCmdDispatch)                   \
+    X(vkCmdFillBuffer)                 \
     X(vkCmdPipelineBarrier)            \
     X(vkCmdWriteTimestamp)             \
     X(vkCmdResetQueryPool)             \
@@ -70,6 +72,10 @@
     X(vkQueueSubmit)                   \
     X(vkDeviceWaitIdle)
 
+// Optional (VK_KHR_cooperative_matrix): may stay null.
+#define MB_VK_OPTIONAL_INSTANCE_FUNCS(X) \
+    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+
 // Optional (VK_KHR_pipeline_executable_properties): may stay null.
 #define MB_VK_OPTIONAL_DEVICE_FUNCS(X)          \
     X(vkGetPipelineExecutablePropertiesKHR)     \
@@ -80,6 +86,7 @@ MB_VK_GLOBAL_FUNCS(MB_VK_DECLARE)
 MB_VK_INSTANCE_FUNCS(MB_VK_DECLARE)
 MB_VK_DEVICE_FUNCS(MB_VK_DECLARE)
 MB_VK_OPTIONAL_DEVICE_FUNCS(MB_VK_DECLARE)
+MB_VK_OPTIONAL_INSTANCE_FUNCS(MB_VK_DECLARE)
 #undef MB_VK_DECLARE
 
 namespace vkl {

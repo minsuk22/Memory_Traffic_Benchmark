@@ -11,6 +11,7 @@ MB_VK_GLOBAL_FUNCS(MB_VK_DEFINE)
 MB_VK_INSTANCE_FUNCS(MB_VK_DEFINE)
 MB_VK_DEVICE_FUNCS(MB_VK_DEFINE)
 MB_VK_OPTIONAL_DEVICE_FUNCS(MB_VK_DEFINE)
+MB_VK_OPTIONAL_INSTANCE_FUNCS(MB_VK_DEFINE)
 #undef MB_VK_DEFINE
 
 static PFN_vkGetInstanceProcAddr s_getInstanceProcAddr = nullptr;
@@ -47,6 +48,9 @@ bool loadInstance(VkInstance instance, const char** err) {
     if (!name) { *err = #name; return false; }
     MB_VK_INSTANCE_FUNCS(MB_LOAD)
 #undef MB_LOAD
+#define MB_LOAD_OPT(name) name = reinterpret_cast<PFN_##name>(s_getInstanceProcAddr(instance, #name));
+    MB_VK_OPTIONAL_INSTANCE_FUNCS(MB_LOAD_OPT)
+#undef MB_LOAD_OPT
     return true;
 }
 

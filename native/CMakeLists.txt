@@ -40,7 +40,7 @@ endif()
 
 # ---- shaders -> SPIR-V (embedded as C arrays) + disassembly for inspection ----------
 set(SPV_INCS "")
-foreach(s read write copy verify)
+foreach(s read write copy verify gemm_tiled)
   set(src "${SHADER_DIR}/${s}.comp")
   add_custom_command(
     OUTPUT "${GEN_DIR}/${s}.spv.inc" "${GEN_DIR}/${s}.spvasm"
@@ -50,6 +50,34 @@ foreach(s read write copy verify)
     COMMENT "glslc ${s}.comp")
   list(APPEND SPV_INCS "${GEN_DIR}/${s}.spv.inc")
 endforeach()
+
+# ---- cooperative-matrix GEMM (boost load): GL_KHR_cooperative_matrix needs a newer
+#      compiler than the NDK's glslc. With glslang (GLSLANG_DIR / VULKAN_SDK / PATH) the
+#      shaders are compiled here, otherwise the committed shaders/prebuilt/*.spv.inc are
+#      used. Target "update_prebuilt_spv" refreshes the committed copies. ---------------
+find_program(GLSLANG NAMES glslang glslangValidator
+  HINTS "$ENV{GLSLANG_DIR}" "$ENV{GLSLANG_DIR}/bin" "$ENV{VULKAN_SDK}/bin" NO_CMAKE_FIND_ROOT_PATH)
+set(_copy_cmds "")
+foreach(s gemm_coop_f32 gemm_coop_f16)
+  set(src "${SHADER_DIR}/${s}.comp")
+  if(GLSLANG)
+    add_custom_command(
+      OUTPUT "${GEN_DIR}/${s}.spv.inc"
+      COMMAND "${GLSLANG}" -V --target-env vulkan1.2 --quiet "-I${SHADER_DIR}" -x -o "${GEN_DIR}/${s}.spv.inc" "${src}"
+      DEPENDS "${src}" "${SHADER_DIR}/gemm_coop.glsl"
+      COMMENT "glslang ${s}.comp")
+    list(APPEND _copy_cmds COMMAND ${CMAKE_COMMAND} -E copy "${GEN_DIR}/${s}.spv.inc" "${SHADER_DIR}/prebuilt/")
+  else()
+    configure_file("${SHADER_DIR}/prebuilt/${s}.spv.inc" "${GEN_DIR}/${s}.spv.inc" COPYONLY)
+  endif()
+  list(APPEND SPV_INCS "${GEN_DIR}/${s}.spv.inc")
+endforeach()
+if(GLSLANG)
+  add_custom_target(update_prebuilt_spv ${_copy_cmds} DEPENDS ${SPV_INCS})
+else()
+  message(STATUS "glslang not found: using prebuilt cooperative-matrix SPIR-V")
+endif()
+
 add_custom_target(membench_shaders DEPENDS ${SPV_INCS})
 
 # ---- core --------------------------------------------------------------------------
@@ -70,6 +98,10 @@ if(MEMBENCH_CLI)
   target_link_libraries(membench PRIVATE membench_core)
   if(MINGW)
     target_link_options(membench PRIVATE -static)
+  endif()
+  if(ANDROID)
+    # NDK r27+ adds debug info to every build type; strip the release executable.
+    target_link_options(membench PRIVATE $<$<CONFIG:Release>:-s>)
   endif()
 endif()
 

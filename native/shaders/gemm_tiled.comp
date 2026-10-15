@@ -1,0 +1,28 @@
+#version 450
+// Fallback 1024^3 GEMM for GPUs without VK_KHR_cooperative_matrix: fp32, 16x16 shared
+// memory tiles. Same purpose as gemm_coop.glsl (GPU load before the measurements).
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PC { uint n; } pc;
+layout(std430, set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+shared float ta[16][16];
+shared float tb[16][16];
+
+void main() {
+    const uint n = pc.n;
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint col = gl_WorkGroupID.x * 16u + tx;
+    uint row = gl_WorkGroupID.y * 16u + ty;
+    float acc = 0.0;
+    for (uint k = 0u; k < n; k += 16u) {
+        ta[ty][tx] = a[row * n + k + tx];
+        tb[ty][tx] = b[(k + ty) * n + col];
+        barrier();
+        for (uint i = 0u; i < 16u; ++i) acc += ta[ty][i] * tb[i][tx];
+        barrier();
+    }
+    c[row * n + col] = acc;
+}

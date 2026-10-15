@@ -7,7 +7,7 @@
 
 namespace mb {
 
-constexpr const char* kVersion = "1.2";
+constexpr const char* kVersion = "1.3";
 
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set
@@ -17,6 +17,9 @@ struct Options {
     int      warmup    = 2;     // minimum warm-up runs per test
     double   warmupMs  = 500;   // ... and minimum warm-up GPU time per test
     double   prewarmMs = 2000;  // GPU load before the first test (clock ramp-up)
+    double   boostMs   = 3000;  // CPU + GPU (1024^3 GEMM) load right before the tests, 0 = off
+    bool     boostCpu  = true;
+    bool     boostGpu  = true;
     bool     testRead  = true;
     bool     testWrite = true;
     bool     testCopy  = true;
