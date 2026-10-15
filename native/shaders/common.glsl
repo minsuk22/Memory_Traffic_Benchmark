@@ -74,7 +74,11 @@ uvec2 mixChecksum(uvec2 acc, uvec4 v, uint G) {
     return acc;
 }
 
-shared uvec2 red[gl_WorkGroupSize.x];
+// Fixed size on purpose: an array sized by the gl_WorkGroupSize spec constant is
+// mis-allocated by some drivers (Adreno 830: nondeterministic checksums). The host
+// rejects --wg > MAX_WG.
+#define MAX_WG 1024u
+shared uvec2 red[MAX_WG];
 
 // Workgroup tree reduction + one atomic per workgroup (keeps result traffic negligible).
 void publish(uvec2 acc) {

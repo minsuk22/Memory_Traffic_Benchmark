@@ -334,7 +334,8 @@ void Bench::createResources() {
     // --- sizes -----------------------------------------------------------------------
     if (!isPow2(o_.lineBytes) || o_.lineBytes < 16 || o_.lineBytes > 4096)
         throw std::runtime_error("--line must be a power of two in [16, 4096]");
-    if (!isPow2(o_.wg) || o_.wg > props_.limits.maxComputeWorkGroupInvocations ||
+    if (!isPow2(o_.wg) || o_.wg > 1024 /* MAX_WG in common.glsl */ ||
+        o_.wg > props_.limits.maxComputeWorkGroupInvocations ||
         o_.wg > props_.limits.maxComputeWorkGroupSize[0])
         throw std::runtime_error("--wg must be a power of two within device limits");
     vplShift_ = log2u(o_.lineBytes / 16);

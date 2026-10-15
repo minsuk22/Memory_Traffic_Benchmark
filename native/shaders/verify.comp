@@ -26,5 +26,8 @@ void main() {
         sum += got.x ^ got.y ^ got.z ^ got.w;
     }
 
-    publish(uvec2(bad, sum));
+    // Mismatches are counted with a direct atomic, independent of the shared-memory
+    // reduction, so a broken reduction cannot turn real mismatches into "0 bad".
+    if (bad != 0u) atomicAdd(res[pc.outSlot].x, bad);
+    publish(uvec2(0u, sum));
 }
