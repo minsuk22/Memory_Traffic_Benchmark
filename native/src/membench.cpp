@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -133,6 +134,12 @@ private:
     void cpuReference(const Job& j, uint32_t out[2]);
     Job readJob(uint32_t pattern, uint32_t key) const;
 
+    // One timed run: returns its time in ms and sets `line` to the per-run log text.
+    using RunFn = std::function<double(int i, std::string& line)>;
+    std::vector<double> measure(const RunFn& runOnce, double bytes, const std::function<bool()>& ready = {});
+    void stability(const std::string& name, const std::vector<double>& gbps);
+
+    void prewarm();
     void fill(uint32_t seedMix);
     bool verifyContent(uint32_t seedMix, const char* what);
     void testRead(uint32_t pattern);
@@ -698,6 +705,77 @@ Job Bench::readJob(uint32_t pattern, uint32_t key) const {
 // Tests
 // ---------------------------------------------------------------------------------------
 
+// Warm-up, then o_.reps measured runs. Warm-up lasts at least o_.warmup runs and
+// o_.warmupMs of GPU time, so short kernels (sequential: ~20 ms) still give the GPU and
+// DRAM clocks time to settle, and continues while `ready` is false (e.g. the CPU
+// reference still running). Returns GB/s of the measured runs.
+std::vector<double> Bench::measure(const RunFn& runOnce, double bytes, const std::function<bool()>& ready) {
+    const int kMaxWarm = 1000;
+    std::vector<double> gbps;
+    int warmRuns = 0, extra = 0;
+    double warmMs = 0;
+    std::string extraLine;
+    for (int i = 0;; ++i) {
+        bool warm = warmRuns < o_.warmup ||
+                    (warmRuns < kMaxWarm && (warmMs < o_.warmupMs || (ready && !ready())));
+        if (!warm && int(gbps.size()) >= o_.reps) break;
+        std::string line;
+        double ms = runOnce(i, line);
+        if (warm) {
+            ++warmRuns;
+            warmMs += ms;
+            if (warmRuns <= o_.warmup) {
+                log("  warm %d: %s", warmRuns, line.c_str());
+            } else {
+                ++extra;
+                extraLine = line;
+            }
+            continue;
+        }
+        if (extra) {
+            log("  warm +%d runs (warm-up total: %d runs, %.0f ms GPU time), last: %s", extra, warmRuns, warmMs,
+                extraLine.c_str());
+            extra = 0;
+        }
+        gbps.push_back(bytes / (ms * 1e6));
+        log("  rep  %d: %s", int(gbps.size()), line.c_str());
+    }
+    return gbps;
+}
+
+// Large run-to-run spread means the clocks changed during the measurement (DVFS,
+// thermal throttling, background load): the numbers are correct but not stable.
+void Bench::stability(const std::string& name, const std::vector<double>& gbps) {
+    if (gbps.size() < 2) return;
+    auto mm = std::minmax_element(gbps.begin(), gbps.end());
+    double spread = (*mm.second - *mm.first) / median(gbps);
+    if (spread > 0.10)
+        verdict("WARN", fmt("%s: run-to-run spread %.0f%% - clocks or temperature changed during the "
+                            "measurement, re-run (cool, plugged in, screen on)", name.c_str(), 100.0 * spread));
+}
+
+// Keeps the GPU and DRAM busy before the first measurement so DVFS can raise the
+// clocks. Uses another permutation key than the tests, so whatever it leaves in the
+// caches (at most a few MiB of a much larger set) is unrelated to the first test.
+void Bench::prewarm() {
+    if (o_.prewarmMs <= 0) return;
+    Job seq = readJob(kSeq, 0);
+    Job rnd = readJob(kRand, readKey_ ^ 0x3C6EF372u);
+    auto t0 = std::chrono::steady_clock::now();
+    double ms = 0, gb = 0;
+    int n = 0;
+    while (ms < o_.prewarmMs) {
+        const Job& j = (n % 4 == 3) ? rnd : seq;  // mostly sequential: high bandwidth raises DRAM clocks
+        execute(j);
+        gb += jobBytes(j) / 1e9;
+        ++n;
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    log("");
+    log("[PRE-WARM] %d read runs, %.1f GB in %.0f ms to raise GPU/DRAM clocks (separate key, not measured)", n,
+        gb, ms);
+}
+
 void Bench::fill(uint32_t seedMix) {
     Job j;
     j.pipe = pWrite_;
@@ -732,39 +810,61 @@ void Bench::testRead(uint32_t pattern) {
     log("");
     log("[%s] %.0f MiB, every line exactly once per run", name.c_str(), bytes / kMiB);
 
+    // The CPU reference is computed while the GPU warms up (the GPU would otherwise idle
+    // and drop its clocks). Measured runs only start once it is done, so it does not
+    // compete with them; warm-up runs are compared against it afterwards.
     uint32_t refc[2] = {0, 0};
-    if (o_.cpuRef) {
-        auto t0 = std::chrono::steady_clock::now();
-        cpuReference(j, refc);
-        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        log("  CPU reference checksum : %08x:%08x  (%.0f ms on %u threads)", refc[0], refc[1], ms,
-            std::max(1u, std::thread::hardware_concurrency()));
-    }
+    double refMs = 0;
+    std::future<void> refJob;
+    if (o_.cpuRef)
+        refJob = std::async(std::launch::async, [&] {
+            auto t0 = std::chrono::steady_clock::now();
+            cpuReference(j, refc);
+            refMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        });
+    auto refReady = [&] {
+        return !refJob.valid() || refJob.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    };
 
-    std::vector<double> gbps, msList;
-    bool allOk = true, allSame = true;
-    uint32_t first[2] = {0, 0};
-    for (int i = 0; i < o_.warmup + o_.reps; ++i) {
-        JobResult r = execute(j);
-        bool wgOk = r.wgDone == r.wgExpected;
-        bool refOk = !o_.cpuRef || (r.chkX == refc[0] && r.chkY == refc[1]);
-        if (i == 0) { first[0] = r.chkX; first[1] = r.chkY; }
-        bool same = r.chkX == first[0] && r.chkY == first[1];
-        bool warm = i < o_.warmup;
-        allOk &= wgOk && refOk;
-        allSame &= same;
-        if (!warm) { gbps.push_back(bytes / (r.ms() * 1e6)); msList.push_back(r.ms()); }
-        log("  %s %d: %9.3f ms  %8.2f GB/s  chk %08x:%08x  wg %u/%u  %s", warm ? "warm" : "rep ",
-            warm ? i + 1 : i - o_.warmup + 1, r.ms(), bytes / (r.ms() * 1e6), r.chkX, r.chkY, r.wgDone,
-            r.wgExpected, (wgOk && refOk) ? (o_.cpuRef ? "MATCH" : "ok") : "MISMATCH");
+    std::vector<double> msList;
+    std::vector<std::array<uint32_t, 2>> chks;
+    bool allWg = true;
+    auto gbps = measure(
+        [&](int, std::string& line) {
+            JobResult r = execute(j);
+            bool wgOk = r.wgDone == r.wgExpected;
+            allWg &= wgOk;
+            chks.push_back({r.chkX, r.chkY});
+            const char* status = !wgOk ? "MISSING WORKGROUPS"
+                                 : !o_.cpuRef ? "ok"
+                                 : !refReady() ? "(CPU reference pending)"
+                                 : (r.chkX == refc[0] && r.chkY == refc[1]) ? "MATCH" : "MISMATCH";
+            line = fmt("%9.3f ms  %8.2f GB/s  chk %08x:%08x  wg %u/%u  %s", r.ms(), bytes / (r.ms() * 1e6), r.chkX,
+                       r.chkY, r.wgDone, r.wgExpected, status);
+            msList.push_back(r.ms());
+            return r.ms();
+        },
+        bytes, refReady);
+    msList.erase(msList.begin(), msList.end() - gbps.size());  // keep measured runs only
+
+    bool allOk = allWg, allSame = true;
+    for (auto& c : chks) allSame &= c == chks[0];
+    if (o_.cpuRef) {
+        refJob.get();
+        for (auto& c : chks) allOk &= c[0] == refc[0] && c[1] == refc[1];
+        log("  CPU reference checksum : %08x:%08x  (%.0f ms on %u threads, during warm-up)", refc[0], refc[1],
+            refMs, std::max(1u, std::thread::hardware_concurrency()));
     }
+    uint32_t first[2] = {chks[0][0], chks[0][1]};
+    const int runs = int(chks.size());
     if (o_.cpuRef)
         verdict(allOk ? "PASS" : "FAIL",
                 fmt("%s: GPU checksum %s CPU reference (%d runs)", name.c_str(),
-                    allOk ? "equals" : "DIFFERS FROM", o_.warmup + o_.reps));
+                    allOk ? "equals" : "DIFFERS FROM", runs));
     verdict(allSame ? "PASS" : "FAIL",
             fmt("%s: checksum %s across repeated runs", name.c_str(), allSame ? "identical" : "NOT identical"));
     rows_.push_back({name, gbps, allOk && allSame});
+    stability(name, gbps);
     if (pattern == kRand) {
         randReadMs_ = median(msList);
         randReadChk_[0] = first[0];
@@ -821,6 +921,7 @@ void Bench::antiOptChecks() {
         Job j2 = j1;
         j2.passes = 2;
         std::vector<double> a, b;
+        execute(j1);  // the GPU idled during the CPU reference above
         for (int i = 0; i < 3; ++i) { a.push_back(execute(j1).ms()); b.push_back(execute(j2).ms()); }
         JobResult r2 = execute(j2);
         bool refOk = true;
@@ -881,29 +982,30 @@ void Bench::testCopy(uint32_t pattern) {
     log("[%s] %.0f MiB read + %.0f MiB write, verified after every run", name.c_str(), bytes / 2 / kMiB,
         bytes / 2 / kMiB);
 
-    std::vector<double> gbps;
     bool allOk = true;
-    for (int i = 0; i < o_.warmup + o_.reps; ++i) {
-        // New source/destination permutations every run: a stale result from the
-        // previous run would fail verification.
-        j.keyBaseA = ref::hash32(seed_ ^ 0xC0C0u) + uint32_t(i);
-        j.keyBaseB = ref::hash32(seed_ ^ 0xD5D5u) + uint32_t(i);
-        JobResult r = execute(j);
-        Job v = j;
-        v.pipe = pVerify_;
-        v.mode = 1;
-        v.unroll = 1;
-        JobResult rv = execute(v);
-        bool ok = r.wgDone == r.wgExpected && rv.chkX == 0 && rv.wgDone == rv.wgExpected;
-        allOk &= ok;
-        bool warm = i < o_.warmup;
-        if (!warm) gbps.push_back(bytes / (r.ms() * 1e6));
-        log("  %s %d: %9.3f ms  %8.2f GB/s  verify: %u bad  %s", warm ? "warm" : "rep ",
-            warm ? i + 1 : i - o_.warmup + 1, r.ms(), bytes / (r.ms() * 1e6), rv.chkX, ok ? "OK" : "FAIL");
-    }
+    auto gbps = measure(
+        [&](int i, std::string& line) {
+            // New source/destination permutations every run: a stale result from the
+            // previous run would fail verification.
+            j.keyBaseA = ref::hash32(seed_ ^ 0xC0C0u) + uint32_t(i);
+            j.keyBaseB = ref::hash32(seed_ ^ 0xD5D5u) + uint32_t(i);
+            JobResult r = execute(j);
+            Job v = j;
+            v.pipe = pVerify_;
+            v.mode = 1;
+            v.unroll = 1;
+            JobResult rv = execute(v);
+            bool ok = r.wgDone == r.wgExpected && rv.chkX == 0 && rv.wgDone == rv.wgExpected;
+            allOk &= ok;
+            line = fmt("%9.3f ms  %8.2f GB/s  verify: %u bad  %s", r.ms(), bytes / (r.ms() * 1e6), rv.chkX,
+                       ok ? "OK" : "FAIL");
+            return r.ms();
+        },
+        bytes);
     verdict(allOk ? "PASS" : "FAIL", fmt("%s: destination content %s", name.c_str(),
                                          allOk ? "verified in every run" : "WRONG in at least one run"));
     rows_.push_back({name, gbps, allOk});
+    stability(name, gbps);
     fill(curSeedMix_);  // restore the destination halves
 }
 
@@ -919,23 +1021,24 @@ void Bench::testWrite(uint32_t pattern) {
     log("[%s] %.0f MiB, new data seed every run, full content verified after every run", name.c_str(),
         bytes / kMiB);
 
-    std::vector<double> gbps;
     bool allOk = true;
-    for (int i = 0; i < o_.warmup + o_.reps; ++i) {
-        j.seedMix = ref::hash32(seed_ ^ (0x57000000u + (pattern << 16) + uint32_t(i)));
-        j.keyBaseA = ref::hash32(seed_ ^ 0xBEEFu) + uint32_t(i);
-        JobResult r = execute(j);
-        bool ok = r.wgDone == r.wgExpected && verifyContent(j.seedMix, name.c_str());
-        curSeedMix_ = j.seedMix;
-        allOk &= ok;
-        bool warm = i < o_.warmup;
-        if (!warm) gbps.push_back(bytes / (r.ms() * 1e6));
-        log("  %s %d: %9.3f ms  %8.2f GB/s  seed %08x  %s", warm ? "warm" : "rep ",
-            warm ? i + 1 : i - o_.warmup + 1, r.ms(), bytes / (r.ms() * 1e6), j.seedMix, ok ? "OK" : "FAIL");
-    }
+    auto gbps = measure(
+        [&](int i, std::string& line) {
+            j.seedMix = ref::hash32(seed_ ^ (0x57000000u + (pattern << 16) + uint32_t(i)));
+            j.keyBaseA = ref::hash32(seed_ ^ 0xBEEFu) + uint32_t(i);
+            JobResult r = execute(j);
+            bool ok = r.wgDone == r.wgExpected && verifyContent(j.seedMix, name.c_str());
+            curSeedMix_ = j.seedMix;
+            allOk &= ok;
+            line = fmt("%9.3f ms  %8.2f GB/s  seed %08x  %s", r.ms(), bytes / (r.ms() * 1e6), j.seedMix,
+                       ok ? "OK" : "FAIL");
+            return r.ms();
+        },
+        bytes);
     verdict(allOk ? "PASS" : "FAIL",
             fmt("%s: memory content %s", name.c_str(), allOk ? "verified after every run" : "WRONG after at least one run"));
     rows_.push_back({name, gbps, allOk});
+    stability(name, gbps);
 }
 
 // Independent path: read the memory produced by the last write run with the random
@@ -1009,10 +1112,12 @@ int Bench::run() {
         seed_ = rd() ^ uint32_t(std::chrono::steady_clock::now().time_since_epoch().count());
         if (!seed_) seed_ = 1;
     }
-    log("membench - GPU-generated DRAM traffic benchmark (Vulkan compute)");
+    log("membench %s - GPU-generated DRAM traffic benchmark (Vulkan compute)", kVersion);
     initVulkan();
     createResources();
     log("Seed           : %u  (reproduce with --seed %u)", seed_, seed_);
+    log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
+        o_.warmup, o_.warmupMs);
     if (o_.injectFault)
         log("*** --inject-fault: every timed kernel silently skips part of its work - checks MUST fail ***");
     readKey_ = ref::hash32(seed_ ^ 0x52454144u);
@@ -1021,6 +1126,7 @@ int Bench::run() {
     log("[INIT] filling the working set with seed-dependent pseudo-random data");
     fill(ref::hash32(seed_));
     verdict(verifyContent(curSeedMix_, "init") ? "PASS" : "FAIL", "initial memory content verified on the GPU");
+    prewarm();
 
     std::vector<uint32_t> pats;
     if (o_.patRand) pats.push_back(kRand);
@@ -1053,7 +1159,9 @@ std::string usage() {
            "  --chunk-mb N     buffer chunk size in MiB (default auto, <= 256)\n"
            "  --line N         bytes fetched per random address: 16..4096 (default 64)\n"
            "  --reps N         measured repetitions (default 5)\n"
-           "  --warmup N       warm-up repetitions (default 2)\n"
+           "  --warmup N       minimum warm-up repetitions per test (default 2)\n"
+           "  --warmup-ms N    minimum warm-up GPU time per test (default 500)\n"
+           "  --prewarm-ms N   GPU load before the first test, 0 = off (default 2000)\n"
            "  --tests LIST     comma list of read,write,copy (default all)\n"
            "  --pattern P      rand | seq | both (default both)\n"
            "  --peak-gbps X    theoretical DRAM bandwidth, results above it fail\n"
@@ -1062,7 +1170,7 @@ std::string usage() {
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
            "  --threads N      invocations per dispatch (default 262144)\n"
-           "  --wg N           workgroup size (default 256)\n"
+           "  --wg N           workgroup size, power of 2 <= 1024 (default 256)\n"
            "  --device N       Vulkan physical device index (default 0)\n"
            "  --inject-fault   self-test: kernels skip part of their work, checks must FAIL\n";
 }
@@ -1085,6 +1193,8 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--line") { if (!next(v)) return false; o.lineBytes = uint32_t(v); }
         else if (k == "--reps") { if (!next(v)) return false; o.reps = int(std::max<uint64_t>(v, 1)); }
         else if (k == "--warmup") { if (!next(v)) return false; o.warmup = int(v); }
+        else if (k == "--warmup-ms") { if (!next(v)) return false; o.warmupMs = double(v); }
+        else if (k == "--prewarm-ms") { if (!next(v)) return false; o.prewarmMs = double(v); }
         else if (k == "--seed") { if (!next(v)) return false; o.seed = uint32_t(v); }
         else if (k == "--threads") { if (!next(v)) return false; o.threads = uint32_t(v); }
         else if (k == "--wg") { if (!next(v)) return false; o.wg = uint32_t(v); }

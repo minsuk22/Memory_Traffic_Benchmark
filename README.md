@@ -57,7 +57,9 @@ Options (`membench --help`):
 | `--line N` | 64 | bytes fetched per random address (16..4096). 64 B = one cache line / DRAM burst |
 | `--tests` | read,write,copy | which traffic types |
 | `--pattern` | both | `rand`, `seq` or `both` (sequential = reference for the random numbers) |
-| `--reps / --warmup` | 5 / 2 | measured / discarded repetitions |
+| `--reps / --warmup` | 5 / 2 | measured / minimum discarded repetitions per test |
+| `--warmup-ms N` | 500 | warm-up also lasts at least this much GPU time per test |
+| `--prewarm-ms N` | 2000 | GPU/DRAM load before the first test so the clocks ramp up (0 = off) |
 | `--peak-gbps X` | – | theoretical DRAM peak; any result above it is a FAIL (traffic did not reach DRAM) |
 | `--sweep` | off | working-set sweep 64 KiB → chunk size: shows the cache → DRAM cliff |
 | `--seed N` | random | reproduce a run exactly |
@@ -113,6 +115,11 @@ bytes should equal the reported traffic (for 64 B lines).
 * `COPY` reports read + write bytes.
 * Mobile GPUs ramp clocks and throttle: look at the median, run a few times, let the phone
   cool down, keep it plugged in, screen on.
+* Warm-up: a 2 s pre-warm (sequential + random reads with a separate permutation key), then
+  per test at least 2 runs and 500 ms of GPU time are discarded. The CPU reference checksum is
+  computed during the warm-up so the GPU never idles before the measured runs. Warm-up cannot
+  leave useful data in the caches: each run touches the whole set (>> cache size) once, so at
+  most a few MiB of the last run survive. A run-to-run spread above 10 % gives a WARN.
 * Timing uses GPU timestamps (falls back to CPU wall time when the queue has none).
 
 ## 6. Results

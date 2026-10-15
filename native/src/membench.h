@@ -7,12 +7,16 @@
 
 namespace mb {
 
+constexpr const char* kVersion = "1.2";
+
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set
     uint32_t chunkMB   = 0;     // 0 = auto (<= 256 MiB, <= device limits)
     uint32_t lineBytes = 64;    // bytes fetched per random address (16..4096, power of 2)
     int      reps      = 5;
-    int      warmup    = 2;
+    int      warmup    = 2;     // minimum warm-up runs per test
+    double   warmupMs  = 500;   // ... and minimum warm-up GPU time per test
+    double   prewarmMs = 2000;  // GPU load before the first test (clock ramp-up)
     bool     testRead  = true;
     bool     testWrite = true;
     bool     testCopy  = true;
