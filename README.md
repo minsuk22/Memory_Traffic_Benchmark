@@ -56,6 +56,7 @@ Options (`membench --help`):
 | option | default | meaning |
 |---|---|---|
 | `--size-mb N` | 1024 | total working set (split into chunks <= 256 MiB) |
+| `--window-mb N` | – | random accesses stay inside N MiB windows, one at a time (no GPU TLB misses, e.g. 64) |
 | `--line N` | 64 | bytes fetched per random address (16..4096). 64 B = one cache line / DRAM burst |
 | `--tests` | read,write,copy | which traffic types |
 | `--pattern` | both | `rand`, `seq` or `both` (sequential = reference for the random numbers) |
@@ -179,6 +180,12 @@ bytes should equal the reported traffic (for 64 B lines).
   byte per rep) at 1 MiB (cache resident = compute ceiling), 64 MiB and the whole set. If the
   whole-set column stays flat while GFLOP/s grows, the GPU cores are waiting for memory, not
   limiting the random read.
+* Random read inside the TLB reach (`--window-mb N`, app button **Rand in 64 MiB**): the working
+  set is split into N MiB chunks, every random pass stays inside one chunk and the chunks run
+  one after another (barrier between them), so at most N MiB are accessed randomly at any time
+  while the whole set is still read once per pass. Choose N below the footprint where the
+  `--dvfs` sweep falls off (Adreno 830: 64 MiB). This is the random-read bandwidth without GPU
+  address-translation misses; the normal run (256 MiB chunks) includes them.
 
 ## 6. Results
 

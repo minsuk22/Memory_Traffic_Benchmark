@@ -7,11 +7,12 @@
 
 namespace mb {
 
-constexpr const char* kVersion = "1.7";
+constexpr const char* kVersion = "1.8";
 
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set
     uint32_t chunkMB   = 0;     // 0 = auto (<= 256 MiB, <= device limits)
+    uint32_t windowMB  = 0;     // random accesses stay inside windows of this size, one window at a time
     uint32_t lineBytes = 64;    // bytes fetched per random address (16..4096, power of 2)
     int      reps      = 5;
     int      warmup    = 2;     // minimum warm-up runs per test

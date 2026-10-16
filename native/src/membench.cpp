@@ -515,7 +515,7 @@ void Bench::createResources() {
     if (total >= 16ull * 1024 * kMiB) throw std::runtime_error("--size-mb must be < 16384");
     chunkBytes_ = chunk;
     chunkLinesBits_ = log2u(chunk / o_.lineBytes);
-    uint64_t nChunks = std::min<uint64_t>(total / chunk, 64);
+    uint64_t nChunks = std::min<uint64_t>(total / chunk, 256);
 
     threadCap_ = o_.threads ? floorPow2(o_.threads) : (1u << 18);
     threadCap_ = std::max<uint64_t>(threadCap_, o_.wg);
@@ -599,7 +599,11 @@ void Bench::createResources() {
         (unsigned long long)(chunkBytes_ / kMiB), (unsigned long long)o_.sizeMB);
     log("Access         : %u B per random address (%u lanes x 16 B), %llu lines per chunk",
         o_.lineBytes, 1u << vplShift_, (unsigned long long)(1ull << chunkLinesBits_));
-    log("Dispatch       : workgroup %u, up to %llu invocations, 4 independent loads per iteration",
+    if (o_.windowMB)
+        log("Random window  : %llu MiB - random accesses stay inside one chunk, chunks run one after another\n"
+            "                 (keeps the random footprint inside the GPU TLB reach; the whole set is still read)",
+            (unsigned long long)(chunkBytes_ / kMiB));
+    log("Dispatch      : workgroup %u, up to %llu invocations, 4 independent loads per iteration",
         o_.wg, (unsigned long long)threadCap_);
 }
 
@@ -798,6 +802,14 @@ JobResult Bench::execute(const Job& j) {
     }
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, j.pipe);
     for (uint32_t c = 0; c < j.numChunks; ++c) {
+        // --window-mb: one window at a time, so the random footprint never exceeds it
+        if (o_.windowMB && c) {
+            VkMemoryBarrier w{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            w.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            w.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                 1, &w, 0, nullptr, 0, nullptr);
+        }
         Push pc{};
         pc.chunkWordBase = uint32_t(c * (chunkBytes_ / 4));
         pc.logicalBase = uint32_t(c * vecs);
@@ -2591,6 +2603,8 @@ std::string usage() {
     return "usage: membench [options]\n"
            "  --size-mb N      total working set in MiB (default 1024)\n"
            "  --chunk-mb N     buffer chunk size in MiB (default auto, <= 256)\n"
+           "  --window-mb N    random accesses stay inside N MiB windows (chunks), one window\n"
+           "                   at a time: random read without GPU TLB misses (e.g. 64)\n"
            "  --line N         bytes fetched per random address: 16..4096 (default 64)\n"
            "  --reps N         measured repetitions (default 5)\n"
            "  --warmup N       minimum warm-up repetitions per test (default 2)\n"
@@ -2636,6 +2650,7 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         if (k == "--help" || k == "-h") o.help = true;
         else if (k == "--size-mb") { if (!next(v)) return false; o.sizeMB = v; }
         else if (k == "--chunk-mb") { if (!next(v)) return false; o.chunkMB = uint32_t(v); }
+        else if (k == "--window-mb") { if (!next(v)) return false; o.windowMB = o.chunkMB = uint32_t(v); }
         else if (k == "--line") { if (!next(v)) return false; o.lineBytes = uint32_t(v); }
         else if (k == "--reps") { if (!next(v)) return false; o.reps = int(std::max<uint64_t>(v, 1)); }
         else if (k == "--warmup") { if (!next(v)) return false; o.warmup = int(v); }

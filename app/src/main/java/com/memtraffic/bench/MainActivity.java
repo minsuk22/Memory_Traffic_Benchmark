@@ -20,8 +20,8 @@ import android.widget.Toast;
  * (see `membench --help`). Output is also written to logcat with tag "membench".
  * Launch with arguments from adb:
  *   adb shell am start -n com.memtraffic.bench/.MainActivity --es args "--size-mb 1024 --sweep"
- * Without adb (e.g. devices managed by an MDM), "Peak finder" / "CPU random" / "Rand vs DVFS" / "Rand + matrix" run
- * --peak / --cpu / --dvfs / --matrix;
+ * Without adb (e.g. devices managed by an MDM), "Peak finder" / "CPU random" / "Rand vs DVFS" / "Rand + matrix" / "Rand in 64 MiB" run
+ * --peak / --cpu / --dvfs / --matrix / --window-mb 64;
  * "Share log" / "Copy log" hand the complete output to any app.
  */
 public class MainActivity extends Activity {
@@ -31,7 +31,7 @@ public class MainActivity extends Activity {
 
     private TextView out;
     private ScrollView scroll;
-    private Button run, peak, cpu, dvfs, mat, share, copy;
+    private Button run, peak, cpu, dvfs, mat, win, share, copy;
     private EditText args;
     private final StringBuilder logText = new StringBuilder();
 
@@ -59,6 +59,7 @@ public class MainActivity extends Activity {
         LinearLayout row2 = new LinearLayout(this);
         dvfs = button(row2, "Rand vs DVFS", v -> start(args.getText().toString() + " --dvfs"));
         mat = button(row2, "Rand + matrix", v -> start(args.getText().toString() + " --matrix"));
+        win = button(row2, "Rand in 64 MiB", v -> start(args.getText().toString() + " --window-mb 64"));
         root.addView(row2);
         LinearLayout row3 = new LinearLayout(this);
         share = button(row3, "Share log", v -> shareLog());
@@ -93,6 +94,7 @@ public class MainActivity extends Activity {
         cpu.setEnabled(false);
         dvfs.setEnabled(false);
         mat.setEnabled(false);
+        win.setEnabled(false);
         out.setText("");
         logText.setLength(0);
         logText.append("device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
@@ -108,6 +110,7 @@ public class MainActivity extends Activity {
                 cpu.setEnabled(true);
                 dvfs.setEnabled(true);
                 mat.setEnabled(true);
+                win.setEnabled(true);
             });
         }, "membench").start();
     }
