@@ -42,6 +42,15 @@ const uint32_t kGemmCoopF32Spv[] = {
 const uint32_t kGemmCoopF16Spv[] = {
 #include "gemm_coop_f16.spv.inc"
 };
+const uint32_t kRandMMAluSpv[] = {
+#include "randmm_alu.spv.inc"
+};
+const uint32_t kRandMMCoopF32Spv[] = {
+#include "randmm_coop_f32.spv.inc"
+};
+const uint32_t kRandMMCoopF16Spv[] = {
+#include "randmm_coop_f16.spv.inc"
+};
 
 // Must match the push_constant block in common.glsl (std430).
 struct Push {
@@ -188,6 +197,8 @@ private:
     };
     SliceRun sliced(const Job& rnd, uint32_t slices, uint64_t seqBytes);
     void dvfs();
+    VkPipeline makeRandMM(bool coop);
+    void matrix();
     int summary();
 
     Options o_;
@@ -2343,6 +2354,149 @@ void Bench::dvfs() {
         std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
 }
 
+// ---------------------------------------------------------------------------------------
+// Random read feeding matrix math (--matrix): is the random read limited by the GPU cores
+// (clock, issue rate) or by the memory side? The kernels load exactly like read.comp (same
+// verified checksum) and use the loaded data as the A operand of matrix multiplies:
+// cooperative matrix (matrix units) where VK_KHR_cooperative_matrix exists, 4x4 fp32
+// matrices on the ALUs otherwise. The matrix work per loaded byte is swept from 0 upwards:
+// while the random read stays memory bound, adding math costs nothing; the cache-resident
+// footprint shows the compute ceiling of each setting.
+// ---------------------------------------------------------------------------------------
+
+VkPipeline Bench::makeRandMM(bool coop) {
+    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    if (coop) {
+        smci.codeSize = coop_.accF16 ? sizeof kRandMMCoopF16Spv : sizeof kRandMMCoopF32Spv;
+        smci.pCode = coop_.accF16 ? kRandMMCoopF16Spv : kRandMMCoopF32Spv;
+    } else {
+        smci.codeSize = sizeof kRandMMAluSpv;
+        smci.pCode = kRandMMAluSpv;
+    }
+    VkShaderModule sm;
+    VK_CHECK(vkCreateShaderModule(dev_, &smci, nullptr, &sm));
+    uint32_t spec[4] = {o_.wg, coop_.M, coop_.N, coop_.K};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {2, 4, 4}, {3, 8, 4}, {4, 12, 4}};
+    VkSpecializationInfo si{coop ? 4u : 1u, me, sizeof spec, spec};
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = sm;
+    cpi.stage.pName = "main";
+    cpi.stage.pSpecializationInfo = &si;
+    cpi.layout = pl_;
+    VkPipeline p;
+    VkResult r = vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpi, nullptr, &p);
+    vkDestroyShaderModule(dev_, sm, nullptr);
+    VK_CHECK(r);
+    return p;
+}
+
+void Bench::matrix() {
+    const auto T0 = std::chrono::steady_clock::now();
+    const uint32_t line0 = o_.lineBytes;
+    const bool coop = coop_.avail && coop_.subgroup <= 128 && coop_.K * coop_.N <= 256 &&
+                      (coop_.subgroup * 32) % (coop_.M * coop_.K) == 0;
+    setConfig(coop ? coop_.subgroup : o_.wg, o_.threads ? uint32_t(threadCap_) : (1u << 20), line0);
+    const uint64_t setBytes = chunks_.size() * chunkBytes_;
+    VkPipeline pmm = makeRandMM(coop);
+    struct Guard {
+        VkDevice d;
+        VkPipeline p;
+        ~Guard() { vkDeviceWaitIdle(d); vkDestroyPipeline(d, p, nullptr); }
+    } guard{dev_, pmm};
+
+    log("");
+    log("[RAND + MATRIX] random read whose data feeds matrix multiplies: GPU cores or memory?");
+    if (coop)
+        log("  kernel: cooperative matrix fp16 x fp16 -> %s, %ux%ux%u tiles, subgroup = workgroup %u",
+            coop_.accF16 ? "fp16" : "fp32", coop_.M, coop_.N, coop_.K, o_.wg);
+    else
+        log("  kernel: 4x4 fp32 matrices on the ALUs (%s), workgroup %u",
+            coop_.avail ? "cooperative matrix configuration not usable here" : "no VK_KHR_cooperative_matrix", o_.wg);
+    log("  every loaded 16 B is matrix data; matrix work = 16 flop per loaded byte x reps");
+    log("  %llu invocations, %u B lines", (unsigned long long)threadCap_, line0);
+    const auto clocks = cpu::findClockFiles();
+    cpu::ClockSampler sampler(clocks);
+
+    // Correctness: the matrix kernel loads exactly what read.comp loads.
+    {
+        Job j = readJob(kRand, readKey_);
+        j.pipe = pmm;
+        j.mode = 4;
+        JobResult r = execute(j);
+        uint32_t refc[2];
+        cpuReference(j, refc);
+        bool ok = r.chkX == refc[0] && r.chkY == refc[1] && r.wgDone == r.wgExpected;
+        verdict(ok ? "PASS" : "FAIL", fmt("matrix kernel (reps 4): read checksum %08x:%08x %s CPU reference", r.chkX,
+                                          r.chkY, ok ? "equals" : "DIFFERS FROM"));
+    }
+
+    std::vector<uint64_t> fps = {kMiB, 64 * kMiB, 0};  // 0 = whole working set
+    auto fpJob = [&](Job j, uint64_t fp) {
+        if (fp) {
+            j.numChunks = 1;
+            j.linesBits = log2u(std::min(fp, chunkBytes_) / line0);
+            j.passes = uint32_t(std::max<uint64_t>(1, (256 * kMiB) / fp));
+            while (vecsPerChunk(j) > 0xFFFFFFFFull) j.passes /= 2;
+        }
+        return j;
+    };
+    log("");
+    log("  GB/s of random reads (GFLOP/s of matrix math); last column: GPU clock during the %llu MiB run",
+        (unsigned long long)(setBytes / kMiB));
+    log("  %-14s %18s %18s %26s  %s", "kernel", "1 MiB (cache)", "64 MiB",
+        fmt("%llu MiB (M acc/s)", (unsigned long long)(setBytes / kMiB)).c_str(), clocks.empty() ? "" : "clock");
+    struct RowRes { std::string name; double big; Stat bigStat; };
+    std::vector<RowRes> rr;
+    const int repsList[] = {-1, 0, 1, 4, 16, 64};  // -1 = plain read.comp
+    for (int reps : repsList) {
+        std::string line;
+        double big = 0;
+        Stat bigStat;
+        std::string clk;
+        for (uint64_t fp : fps) {
+            Job j = fpJob(readJob(kRand, readKey_), fp);
+            if (reps >= 0) {
+                j.pipe = pmm;
+                j.mode = uint32_t(reps);
+            }
+            if (!fp) sampler.start();
+            Stat s = timeJob(j, jobBytes(j), 2);
+            if (!fp) clk = sampler.stop();
+            const double gflops = s.med * 16.0 * std::max(reps, 0);
+            if (fp) {
+                line += fmt(" %8.2f (%7.0f)", s.med, gflops);
+            } else {
+                line += fmt(" %8.2f %6.1f (%7.0f)", s.med, s.med * 1e3 / line0, gflops);
+                big = s.med;
+                bigStat = s;
+            }
+        }
+        std::string name = reps < 0 ? "read.comp" : fmt("matrix x%d", reps);
+        log("  %-14s%s  %s", name.c_str(), line.c_str(), clk.c_str());
+        rr.push_back({name, big, bigStat});
+    }
+    for (auto& r : rr)
+        if (r.name == "read.comp" || r.name == "matrix x16")
+            rows_.push_back({fmt("rand %s", r.name.c_str()), r.bigStat.runs, r.bigStat.ok});
+
+    log("");
+    log("==================================== RAND + MATRIX ====================================");
+    const double base = rr[0].big;
+    double lo = 1e300, hi = 0;
+    for (size_t i = 1; i < rr.size(); ++i) {
+        lo = std::min(lo, rr[i].big);
+        hi = std::max(hi, rr[i].big);
+    }
+    log("  %llu MiB random read: read.comp %.2f GB/s, matrix kernels %.2f .. %.2f GB/s",
+        (unsigned long long)(setBytes / kMiB), base, lo, hi);
+    log("  read your table: where the 1 MiB column falls with more reps, the GPU cores are the limit;");
+    log("  as long as the %llu MiB column stays flat while GFLOP/s grows, the cores wait for memory",
+        (unsigned long long)(setBytes / kMiB));
+    log("  RAND + MATRIX time: %.0f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
+}
+
 int Bench::summary() {
     log("");
     log("==================================== SUMMARY ====================================");
@@ -2385,9 +2539,9 @@ int Bench::run() {
     initVulkan();
     createResources();
     log("Seed           : %u  (reproduce with --seed %u)", seed_, seed_);
-    if (!o_.peak && !o_.cpu && !o_.dvfs) log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
+    if (!o_.peak && !o_.cpu && !o_.dvfs && !o_.matrix) log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
         o_.warmup, o_.warmupMs);
-    if (!o_.peak && !o_.cpu && !o_.dvfs && o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
+    if (!o_.peak && !o_.cpu && !o_.dvfs && !o_.matrix && o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
         log("Boost          : %.0f ms %s load before the tests", o_.boostMs,
             o_.boostCpu && o_.boostGpu ? "CPU + GPU GEMM" : o_.boostCpu ? "CPU" : "GPU GEMM");
     if (o_.injectFault)
@@ -2398,8 +2552,9 @@ int Bench::run() {
     log("[INIT] filling the working set with seed-dependent pseudo-random data");
     fill(ref::hash32(seed_));
     verdict(verifyContent(curSeedMix_, "init") ? "PASS" : "FAIL", "initial memory content verified on the GPU");
-    if (o_.peak || o_.cpu || o_.dvfs) {
-        if (o_.dvfs) dvfs();
+    if (o_.peak || o_.cpu || o_.dvfs || o_.matrix) {
+        if (o_.matrix) matrix();
+        else if (o_.dvfs) dvfs();
         else if (o_.peak) peak();
         else cpuRand();
         return summary();
@@ -2455,6 +2610,8 @@ std::string usage() {
            "  --dvfs           random read vs memory clock governors: with CPU background\n"
            "                   traffic, with GPU sequential reads between random slices, and\n"
            "                   the footprint sweep idle / loaded (~1 min)\n"
+           "  --matrix         random read whose data feeds matrix multiplies (cooperative\n"
+           "                   matrix, ALU fallback), matrix work swept 0..64 reps\n"
            "  --no-checks      skip the anti-optimisation checks\n"
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
@@ -2501,6 +2658,7 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--peak") o.peak = true;
         else if (k == "--cpu") o.cpu = true;
         else if (k == "--dvfs") o.dvfs = true;
+        else if (k == "--matrix") o.matrix = true;
         else if (k == "--no-checks") o.checks = false;
         else if (k == "--no-cpu-ref") o.cpuRef = false;
         else if (k == "--inject-fault") o.injectFault = true;

@@ -69,6 +69,7 @@ Options (`membench --help`):
 | `--peak` | off | peak finder (~2.5 min, see below) instead of the normal tests |
 | `--cpu` | off | CPU random read peak (see below) instead of the normal tests |
 | `--dvfs` | off | random read vs memory clock governors (see below) instead of the normal tests |
+| `--matrix` | off | random read feeding matrix multiplies (see below) instead of the normal tests |
 | `--seed N` | random | reproduce a run exactly |
 | `--no-cpu-ref` | – | skip CPU reference checksums (faster, weaker) |
 | `--inject-fault` | – | self-test: kernels silently skip part of their work → the checks must FAIL |
@@ -170,6 +171,14 @@ bytes should equal the reported traffic (for 64 B lines).
   A large gain in A or B means the governors limit the random read; a footprint cliff that
   stays with the clocks up means GPU address translation (TLB reach) does. Clock files
   (`/sys/class/devfreq/*/cur_freq`, kgsl `gpuclk`) are sampled when the app may read them.
+* Random read + matrix math (`--matrix`, app button **Rand + matrix**): kernels that load
+  exactly like `read.comp` (same verified checksum) and use every loaded byte as matrix data —
+  `coopMatMulAdd` on the matrix units with `VK_KHR_cooperative_matrix`
+  (`shaders/randmm_coop.glsl`), 4x4 fp32 matrices on the ALUs otherwise
+  (`shaders/randmm_alu.comp`). The matrix work is swept from 0 to 64 reps (16 flop per loaded
+  byte per rep) at 1 MiB (cache resident = compute ceiling), 64 MiB and the whole set. If the
+  whole-set column stays flat while GFLOP/s grows, the GPU cores are waiting for memory, not
+  limiting the random read.
 
 ## 6. Results
 

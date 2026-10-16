@@ -40,7 +40,7 @@ endif()
 
 # ---- shaders -> SPIR-V (embedded as C arrays) + disassembly for inspection ----------
 set(SPV_INCS "")
-foreach(s read write copy verify gemm_tiled)
+foreach(s read write copy verify gemm_tiled randmm_alu)
   set(src "${SHADER_DIR}/${s}.comp")
   add_custom_command(
     OUTPUT "${GEN_DIR}/${s}.spv.inc" "${GEN_DIR}/${s}.spvasm"
@@ -58,13 +58,13 @@ endforeach()
 find_program(GLSLANG NAMES glslang glslangValidator
   HINTS "$ENV{GLSLANG_DIR}" "$ENV{GLSLANG_DIR}/bin" "$ENV{VULKAN_SDK}/bin" NO_CMAKE_FIND_ROOT_PATH)
 set(_copy_cmds "")
-foreach(s gemm_coop_f32 gemm_coop_f16)
+foreach(s gemm_coop_f32 gemm_coop_f16 randmm_coop_f32 randmm_coop_f16)
   set(src "${SHADER_DIR}/${s}.comp")
   if(GLSLANG)
     add_custom_command(
       OUTPUT "${GEN_DIR}/${s}.spv.inc"
       COMMAND "${GLSLANG}" -V --target-env vulkan1.2 --quiet "-I${SHADER_DIR}" -x -o "${GEN_DIR}/${s}.spv.inc" "${src}"
-      DEPENDS "${src}" "${SHADER_DIR}/gemm_coop.glsl"
+      DEPENDS "${src}" "${SHADER_DIR}/gemm_coop.glsl" "${SHADER_DIR}/randmm_coop.glsl" "${SHADER_DIR}/common.glsl"
       COMMENT "glslang ${s}.comp")
     list(APPEND _copy_cmds COMMAND ${CMAKE_COMMAND} -E copy "${GEN_DIR}/${s}.spv.inc" "${SHADER_DIR}/prebuilt/")
   else()

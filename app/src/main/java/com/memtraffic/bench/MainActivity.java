@@ -20,7 +20,8 @@ import android.widget.Toast;
  * (see `membench --help`). Output is also written to logcat with tag "membench".
  * Launch with arguments from adb:
  *   adb shell am start -n com.memtraffic.bench/.MainActivity --es args "--size-mb 1024 --sweep"
- * Without adb (e.g. devices managed by an MDM), "Peak finder" / "CPU random" / "Rand vs DVFS" run --peak / --cpu / --dvfs;
+ * Without adb (e.g. devices managed by an MDM), "Peak finder" / "CPU random" / "Rand vs DVFS" / "Rand + matrix" run
+ * --peak / --cpu / --dvfs / --matrix;
  * "Share log" / "Copy log" hand the complete output to any app.
  */
 public class MainActivity extends Activity {
@@ -30,7 +31,7 @@ public class MainActivity extends Activity {
 
     private TextView out;
     private ScrollView scroll;
-    private Button run, peak, cpu, dvfs, share, copy;
+    private Button run, peak, cpu, dvfs, mat, share, copy;
     private EditText args;
     private final StringBuilder logText = new StringBuilder();
 
@@ -57,9 +58,12 @@ public class MainActivity extends Activity {
         root.addView(row1);
         LinearLayout row2 = new LinearLayout(this);
         dvfs = button(row2, "Rand vs DVFS", v -> start(args.getText().toString() + " --dvfs"));
-        share = button(row2, "Share log", v -> shareLog());
-        copy = button(row2, "Copy log", v -> copyLog());
+        mat = button(row2, "Rand + matrix", v -> start(args.getText().toString() + " --matrix"));
         root.addView(row2);
+        LinearLayout row3 = new LinearLayout(this);
+        share = button(row3, "Share log", v -> shareLog());
+        copy = button(row3, "Copy log", v -> copyLog());
+        root.addView(row3);
 
         scroll = new ScrollView(this);
         out = new TextView(this);
@@ -88,6 +92,7 @@ public class MainActivity extends Activity {
         peak.setEnabled(false);
         cpu.setEnabled(false);
         dvfs.setEnabled(false);
+        mat.setEnabled(false);
         out.setText("");
         logText.setLength(0);
         logText.append("device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
@@ -102,6 +107,7 @@ public class MainActivity extends Activity {
                 peak.setEnabled(true);
                 cpu.setEnabled(true);
                 dvfs.setEnabled(true);
+                mat.setEnabled(true);
             });
         }, "membench").start();
     }

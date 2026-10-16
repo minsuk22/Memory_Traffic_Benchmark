@@ -1,0 +1,5 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// fp16 x fp16 -> fp16 accumulate
+#define ACC_T float16_t
+#include "randmm_coop.glsl"

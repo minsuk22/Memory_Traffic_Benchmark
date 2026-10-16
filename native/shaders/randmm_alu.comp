@@ -1,0 +1,56 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Random READ feeding matrix math on the regular ALUs (GPUs without
+// VK_KHR_cooperative_matrix): the same loads and checksum as read.comp; every 2 x 16 B
+// loaded become a 4x4 fp32 matrix A, and C = B * (A + C) is applied 4 * pc.mode times per
+// matrix (a chain the compiler cannot shorten). 16 flop per loaded byte per rep, like
+// randmm_coop.glsl. pc.mode = 0: plain read with the conversions.
+
+#include "common.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer Data { uvec4 data[]; };
+
+// Raw data as fp16, exponent bits limited so every value is finite and < 1.
+mat4 toMat(uvec4 a, uvec4 b) {
+    return mat4(vec4(unpackHalf2x16(a.x & 0x3BFF3BFFu), unpackHalf2x16(a.y & 0x3BFF3BFFu)),
+                vec4(unpackHalf2x16(a.z & 0x3BFF3BFFu), unpackHalf2x16(a.w & 0x3BFF3BFFu)),
+                vec4(unpackHalf2x16(b.x & 0x3BFF3BFFu), unpackHalf2x16(b.y & 0x3BFF3BFFu)),
+                vec4(unpackHalf2x16(b.z & 0x3BFF3BFFu), unpackHalf2x16(b.w & 0x3BFF3BFFu)));
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x + pc.dstVecOffset;
+    uint T   = pc.numThreads;
+    uvec2 acc = uvec2(0u);
+
+    mat4 B;
+    for (uint i = 0u; i < 16u; ++i) B[i >> 2][i & 3u] = float(hash32(i ^ pc.keyA.y) & 0xFFu) * (1.0 / 8192.0);
+    mat4 C = mat4(0.0);
+    const uint reps = 4u * pc.mode;
+
+    for (uint it = 0u; it < pc.itersPerThread; it += 4u) {
+        uint g0 = (it + 0u) * T + tid;
+        uint g1 = (it + 1u) * T + tid;
+        uint g2 = (it + 2u) * T + tid;
+        uint g3 = (it + 3u) * T + tid;
+        uvec4 v0 = data[vecIndex(g0, pc.keyA)];
+        uvec4 v1 = data[vecIndex(g1, pc.keyA)];
+        uvec4 v2 = data[vecIndex(g2, pc.keyA)];
+        uvec4 v3 = data[vecIndex(g3, pc.keyA)];
+        acc = mixChecksum(acc, v0, pc.logicalBase + g0);
+        acc = mixChecksum(acc, v1, pc.logicalBase + g1);
+        acc = mixChecksum(acc, v2, pc.logicalBase + g2);
+        acc = mixChecksum(acc, v3, pc.logicalBase + g3);
+        mat4 A0 = toMat(v0, v1), A1 = toMat(v2, v3);
+        C += A0 + A1;
+        for (uint r = 0u; r < reps; ++r) {
+            C = B * (A0 + C);
+            C = B * (A1 + C);
+        }
+    }
+
+    publish(acc);
+    // Keeps the matrix work alive without touching the verified checksum.
+    float s = dot(C[0] + C[1] + C[2] + C[3], vec4(1.0));
+    if (floatBitsToUint(s) == 0x7FC00001u) atomicAdd(res[pc.outSlot].w, 1u);
+}
