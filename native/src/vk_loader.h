@@ -28,6 +28,8 @@
     X(vkDestroyDevice)                 \
     X(vkGetDeviceQueue)                \
     X(vkCreateBuffer)                  \
+    X(vkCreateBufferView)              \
+    X(vkDestroyBufferView)             \
     X(vkDestroyBuffer)                 \
     X(vkGetBufferMemoryRequirements)   \
     X(vkAllocateMemory)                \

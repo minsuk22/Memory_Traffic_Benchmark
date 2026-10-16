@@ -1,0 +1,5 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Random read tuning kernel, loads through a uniform texel buffer (see read_tune.glsl).
+#define TEXEL 1
+#include "read_tune.glsl"

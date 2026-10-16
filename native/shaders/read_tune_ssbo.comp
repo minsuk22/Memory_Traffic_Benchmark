@@ -1,0 +1,4 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Random read tuning kernel, loads through the storage buffer (see read_tune.glsl).
+#include "read_tune.glsl"

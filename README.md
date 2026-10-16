@@ -71,6 +71,7 @@ Options (`membench --help`):
 | `--cpu` | off | CPU random read peak (see below) instead of the normal tests |
 | `--dvfs` | off | random read vs memory clock governors (see below) instead of the normal tests |
 | `--matrix` | off | random read feeding matrix multiplies (see below) instead of the normal tests |
+| `--rand-tune` | off | random read tuning inside a TLB-sized window (see below) instead of the normal tests |
 | `--seed N` | random | reproduce a run exactly |
 | `--no-cpu-ref` | – | skip CPU reference checksums (faster, weaker) |
 | `--inject-fault` | – | self-test: kernels silently skip part of their work → the checks must FAIL |
@@ -186,6 +187,16 @@ bytes should equal the reported traffic (for 64 B lines).
   while the whole set is still read once per pass. Choose N below the footprint where the
   `--dvfs` sweep falls off (Adreno 830: 64 MiB). This is the random-read bandwidth without GPU
   address-translation misses; the normal run (256 MiB chunks) includes them.
+* Random read tuning (`--rand-tune`, app button **Rand tuning**, ~1 min): inside a 64 MiB
+  window (or `--window-mb N`), what else limits the random read? A greedy search varies one
+  factor at a time and keeps the best value (> 3 % better, candidates measured round-robin):
+  invocations per dispatch (GPU-wide memory-level parallelism), workgroup size, random lines
+  in flight per invocation (`UNROLL` 1..16), bytes one lane loads per line (16 / 32 / 64 B),
+  load path (storage buffer vs uniform texel buffer = texture pipe), subgroup size
+  (`VK_EXT_subgroup_size_control`), window size, and — for information only — the access size
+  32..256 B. Kernel: `shaders/read_tune.glsl` (same addresses, data and checksum as
+  `read.comp`); every timed run is checked against the CPU reference. If no shape helps but
+  larger lines do, the limit is the per-access cost of DRAM (row activations), not the GPU.
 
 ## 6. Results
 

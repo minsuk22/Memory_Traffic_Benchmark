@@ -40,13 +40,13 @@ endif()
 
 # ---- shaders -> SPIR-V (embedded as C arrays) + disassembly for inspection ----------
 set(SPV_INCS "")
-foreach(s read write copy verify gemm_tiled randmm_alu)
+foreach(s read write copy verify gemm_tiled randmm_alu read_tune_ssbo read_tune_texel)
   set(src "${SHADER_DIR}/${s}.comp")
   add_custom_command(
     OUTPUT "${GEN_DIR}/${s}.spv.inc" "${GEN_DIR}/${s}.spvasm"
     COMMAND "${GLSLC}" -O --target-env=vulkan1.1 -I "${SHADER_DIR}" -mfmt=num -o "${GEN_DIR}/${s}.spv.inc" "${src}"
     COMMAND "${GLSLC}" -O --target-env=vulkan1.1 -I "${SHADER_DIR}" -S -o "${GEN_DIR}/${s}.spvasm" "${src}"
-    DEPENDS "${src}" "${SHADER_DIR}/common.glsl"
+    DEPENDS "${src}" "${SHADER_DIR}/common.glsl" "${SHADER_DIR}/read_tune.glsl"
     COMMENT "glslc ${s}.comp")
   list(APPEND SPV_INCS "${GEN_DIR}/${s}.spv.inc")
 endforeach()

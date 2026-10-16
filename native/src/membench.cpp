@@ -1,4 +1,4 @@
-#include "membench.h"
+﻿#include "membench.h"
 
 #include <algorithm>
 #include <array>
@@ -9,9 +9,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 
 #include "cpu_mem.h"
 #include "reference.h"
@@ -50,6 +52,12 @@ const uint32_t kRandMMCoopF32Spv[] = {
 };
 const uint32_t kRandMMCoopF16Spv[] = {
 #include "randmm_coop_f16.spv.inc"
+};
+const uint32_t kReadTuneSsboSpv[] = {
+#include "read_tune_ssbo.spv.inc"
+};
+const uint32_t kReadTuneTexelSpv[] = {
+#include "read_tune_texel.spv.inc"
 };
 
 // Must match the push_constant block in common.glsl (std430).
@@ -154,6 +162,8 @@ private:
     uint64_t vecsPerChunk(const Job& j) const { return uint64_t(j.passes) << (j.linesBits + vplShift_); }
     double jobBytes(const Job& j) const { return double(vecsPerChunk(j)) * 16.0 * j.numChunks; }
     JobResult execute(const Job& j);
+    JobResult submitTimed(const std::function<void()>& dispatches);
+    void computeBarrier();  // compute -> compute dependency inside cmd_
     void cpuReference(const Job& j, uint32_t out[2]);
     Job readJob(uint32_t pattern, uint32_t key) const;
 
@@ -199,6 +209,7 @@ private:
     void dvfs();
     VkPipeline makeRandMM(bool coop);
     void matrix();
+    void randTune();
     int summary();
 
     Options o_;
@@ -214,6 +225,12 @@ private:
     uint64_t maxAlloc_ = 0;
     uint32_t tsBits_ = 0;
     bool statsExt_ = false;
+    uint32_t subgroupSize_ = 0;  // default subgroup size
+    // VK_EXT_subgroup_size_control / Vulkan 1.3 (enabled for --rand-tune only)
+    struct SgCtl {
+        bool avail = false;
+        uint32_t minSize = 0, maxSize = 0, maxSubgroups = 0;
+    } sgCtl_;
 
     struct Chunk {
         VkBuffer buf = VK_NULL_HANDLE;
@@ -337,11 +354,22 @@ void Bench::initVulkan() {
     VkPhysicalDeviceSubgroupProperties sgp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceCooperativeMatrixPropertiesKHR cmp{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR};
+    VkPhysicalDeviceSubgroupSizeControlProperties sscp{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceProperties pre;
+    vkGetPhysicalDeviceProperties(phys_, &pre);
+    const bool v13 = pre.apiVersion >= VK_API_VERSION_1_3;
+    const bool hasSgExt = !v13 && hasExt(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     p2.pNext = &m3;
     m3.pNext = &sgp;
     if (hasCoopExt) sgp.pNext = &cmp;
+    if (v13 || hasSgExt) {
+        sscp.pNext = p2.pNext;
+        p2.pNext = &sscp;
+    }
     vkGetPhysicalDeviceProperties2(phys_, &p2);
+    subgroupSize_ = sgp.subgroupSize;
     props_ = p2.properties;
     maxAlloc_ = m3.maxMemoryAllocationSize;
     if (props_.apiVersion < VK_API_VERSION_1_1) throw std::runtime_error("Vulkan 1.1 device required");
@@ -368,6 +396,7 @@ void Bench::initVulkan() {
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR fcm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceSubgroupSizeControlFeatures fsg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
     {
         VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         void** tail = &f2.pNext;
@@ -375,9 +404,17 @@ void Bench::initVulkan() {
         if (hasStatsExt) link(&pef);
         if (v12) { link(&f11); link(&f12); }
         if (v12 && hasCoopExt) link(&fcm);
+        if (v13 || hasSgExt) link(&fsg);
         vkGetPhysicalDeviceFeatures2(phys_, &f2);
     }
     statsExt_ = hasStatsExt && pef.pipelineExecutableInfo;
+    // Explicit subgroup sizes: only requested for --rand-tune, so other modes run unchanged.
+    sgCtl_.avail = o_.randTune && fsg.subgroupSizeControl &&
+                   (sscp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) && sscp.minSubgroupSize &&
+                   sscp.maxSubgroupSize >= sscp.minSubgroupSize;
+    sgCtl_.minSize = sscp.minSubgroupSize;
+    sgCtl_.maxSize = sscp.maxSubgroupSize;
+    sgCtl_.maxSubgroups = sscp.maxComputeWorkgroupSubgroups;
 
     std::string coopWhy;
     if (!hasCoopExt) coopWhy = "VK_KHR_cooperative_matrix not supported";
@@ -453,6 +490,12 @@ void Bench::initVulkan() {
         link(&e12);
         link(&ecm);
     }
+    VkPhysicalDeviceSubgroupSizeControlFeatures esg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+    if (sgCtl_.avail) {
+        if (hasSgExt) extNames.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+        esg.subgroupSizeControl = VK_TRUE;
+        link(&esg);
+    }
     dci.pNext = chain;
     dci.enabledExtensionCount = uint32_t(extNames.size());
     dci.ppEnabledExtensionNames = extNames.data();
@@ -474,6 +517,13 @@ void Bench::initVulkan() {
             coop_.accF16 ? "fp16" : "fp32", coop_.M, coop_.N, coop_.K, coop_.subgroup);
     else
         log("Matrix units   : not used (%s)", coopWhy.c_str());
+    if (v13 || hasSgExt)
+        log("Subgroups      : %u lanes by default, %u..%u selectable (compute: %s, control feature: %s)",
+            subgroupSize_, sscp.minSubgroupSize, sscp.maxSubgroupSize,
+            sscp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT ? "yes" : "no",
+            fsg.subgroupSizeControl ? "yes" : "no");
+    else
+        log("Subgroups      : %u lanes", subgroupSize_);
     for (uint32_t i = 0; i < memProps_.memoryHeapCount; ++i)
         log("Memory heap %u  : %8llu MiB %s", i, (unsigned long long)(memProps_.memoryHeaps[i].size / kMiB),
             memProps_.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? "DEVICE_LOCAL" : "");
@@ -611,6 +661,7 @@ size_t Bench::allocChunks(size_t n) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = chunkBytes_;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (o_.randTune) bci.usage |= VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;  // texture-path loads
     size_t got = 0;
     for (; got < n; ++got) {
         Chunk ch;
@@ -782,6 +833,46 @@ JobResult Bench::execute(const Job& j) {
     // Self-test: emulate a driver that drops part of the work (the last loop iterations).
     if (o_.injectFault && j.pipe != pVerify_ && j.pipe != pReadDead_ && iters > j.unroll) iters -= j.unroll;
 
+    JobResult r = submitTimed([&] {
+        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, j.pipe);
+        for (uint32_t c = 0; c < j.numChunks; ++c) {
+            // --window-mb: one window at a time, so the random footprint never exceeds it
+            if (o_.windowMB && c) computeBarrier();
+            Push pc{};
+            pc.chunkWordBase = uint32_t(c * (chunkBytes_ / 4));
+            pc.logicalBase = uint32_t(c * vecs);
+            pc.linesMask = (1u << j.linesBits) - 1u;
+            pc.linesBits = j.linesBits;
+            pc.vplShift = vplShift_;
+            pc.pattern = j.pattern;
+            pc.seedMix = j.seedMix;
+            pc.outSlot = 0;
+            deriveKey(j.keyBaseA, c, pc.keyA);
+            deriveKey(j.keyBaseB, c, pc.keyB);
+            pc.itersPerThread = iters;
+            pc.numThreads = uint32_t(T);
+            pc.dstVecOffset = j.dstVecOffset;
+            pc.mode = j.mode;
+            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pl_, 0, 1, &chunks_[c].set, 0, nullptr);
+            vkCmdPushConstants(cmd_, pl_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+            vkCmdDispatch(cmd_, groups, 1, 1);
+        }
+    });
+    r.wgExpected = groups * j.numChunks;
+    return r;
+}
+
+void Bench::computeBarrier() {
+    VkMemoryBarrier w{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    w.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    w.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &w,
+                         0, nullptr, 0, nullptr);
+}
+
+// Zeroes the result slot, records `dispatches` between two timestamps into cmd_, submits
+// and waits. Returns the times and result slot 0 (wgExpected is left to the caller).
+JobResult Bench::submitTimed(const std::function<void()>& dispatches) {
     for (int i = 0; i < 4; ++i) outMap_[i] = 0;
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -800,35 +891,7 @@ JobResult Bench::execute(const Job& j) {
         vkCmdResetQueryPool(cmd_, qpool_, 0, 2);
         vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool_, 0);
     }
-    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, j.pipe);
-    for (uint32_t c = 0; c < j.numChunks; ++c) {
-        // --window-mb: one window at a time, so the random footprint never exceeds it
-        if (o_.windowMB && c) {
-            VkMemoryBarrier w{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            w.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            w.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                                 1, &w, 0, nullptr, 0, nullptr);
-        }
-        Push pc{};
-        pc.chunkWordBase = uint32_t(c * (chunkBytes_ / 4));
-        pc.logicalBase = uint32_t(c * vecs);
-        pc.linesMask = (1u << j.linesBits) - 1u;
-        pc.linesBits = j.linesBits;
-        pc.vplShift = vplShift_;
-        pc.pattern = j.pattern;
-        pc.seedMix = j.seedMix;
-        pc.outSlot = 0;
-        deriveKey(j.keyBaseA, c, pc.keyA);
-        deriveKey(j.keyBaseB, c, pc.keyB);
-        pc.itersPerThread = iters;
-        pc.numThreads = uint32_t(T);
-        pc.dstVecOffset = j.dstVecOffset;
-        pc.mode = j.mode;
-        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pl_, 0, 1, &chunks_[c].set, 0, nullptr);
-        vkCmdPushConstants(cmd_, pl_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
-        vkCmdDispatch(cmd_, groups, 1, 1);
-    }
+    dispatches();
     if (qpool_) vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool_, 1);
 
     mbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -858,17 +921,17 @@ JobResult Bench::execute(const Job& j) {
     r.chkX = outMap_[0];
     r.chkY = outMap_[1];
     r.wgDone = outMap_[2];
-    r.wgExpected = groups * j.numChunks;
     return r;
 }
 
-// Same checksum as read.comp, computed on all CPU cores.
-void Bench::cpuReference(const Job& j, uint32_t out[2]) {
-    const uint64_t vecs = vecsPerChunk(j);
+// Sum of ref::readChecksum over `regions` regions of `vecs` logical indices each, on all
+// CPU cores. `region(r, p, wordBase, logicalBase)` fills in the parameters of region r.
+using RegionFn = std::function<void(uint32_t r, ref::Params& p, uint32_t& wordBase, uint32_t& logicalBase)>;
+void refChecksum(uint32_t regions, uint64_t vecs, const RegionFn& region, uint32_t out[2]) {
     const uint64_t piece = 1u << 20;
     struct Task { uint32_t c, b, e; };
     std::vector<Task> tasks;
-    for (uint32_t c = 0; c < j.numChunks; ++c)
+    for (uint32_t c = 0; c < regions; ++c)
         for (uint64_t b = 0; b < vecs; b += piece)
             tasks.push_back({c, uint32_t(b), uint32_t(std::min(vecs, b + piece))});
 
@@ -882,16 +945,27 @@ void Bench::cpuReference(const Job& j, uint32_t out[2]) {
                 size_t i = next++;
                 if (i >= tasks.size()) break;
                 const Task& k = tasks[i];
-                ref::Params p{(1u << j.linesBits) - 1u, j.linesBits, vplShift_, j.pattern, j.seedMix, {}};
-                deriveKey(j.keyBaseA, k.c, p.keyA);
-                ref::readChecksum(p, uint32_t(k.c * (chunkBytes_ / 4)), uint32_t(k.c * vecs), k.b, k.e,
-                                  part[t].data());
+                ref::Params p{};
+                uint32_t wordBase = 0, logicalBase = 0;
+                region(k.c, p, wordBase, logicalBase);
+                ref::readChecksum(p, wordBase, logicalBase, k.b, k.e, part[t].data());
             }
         });
     }
     for (auto& t : th) t.join();
     out[0] = out[1] = 0;
     for (auto& p : part) { out[0] += p[0]; out[1] += p[1]; }
+}
+
+// Same checksum as read.comp, computed on all CPU cores.
+void Bench::cpuReference(const Job& j, uint32_t out[2]) {
+    const uint64_t vecs = vecsPerChunk(j);
+    refChecksum(j.numChunks, vecs, [&](uint32_t c, ref::Params& p, uint32_t& wordBase, uint32_t& logicalBase) {
+        p = {(1u << j.linesBits) - 1u, j.linesBits, vplShift_, j.pattern, j.seedMix, {}};
+        deriveKey(j.keyBaseA, c, p.keyA);
+        wordBase = uint32_t(c * (chunkBytes_ / 4));
+        logicalBase = uint32_t(c * vecs);
+    }, out);
 }
 
 Job Bench::readJob(uint32_t pattern, uint32_t key) const {
@@ -2509,6 +2583,456 @@ void Bench::matrix() {
     log("  RAND + MATRIX time: %.0f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
 }
 
+// ---------------------------------------------------------------------------------------
+// Random read tuning (--rand-tune). Inside a window that the GPU TLB covers (v1.8: 64 MiB
+// windows gave ~50% of sequential), what else limits the random read? Each section varies
+// one factor and keeps the best value for the following sections (greedy search):
+//   invocations (memory-level parallelism of the whole GPU), workgroup size, random lines
+//   in flight per invocation, bytes per lane, load path (storage buffer / texel buffer =
+//   texture pipe), subgroup size, window size; access size last (information only: lines
+//   above 64 B are a different test). Every timed run is compared with the CPU reference.
+// ---------------------------------------------------------------------------------------
+
+void Bench::randTune() {
+    const auto T0 = std::chrono::steady_clock::now();
+    const uint32_t line0 = o_.lineBytes;
+    const uint64_t setBytes = chunks_.size() * chunkBytes_;
+    const uint32_t rkey = readKey_;
+    const uint64_t maxGroups = floorPow2(props_.limits.maxComputeWorkGroupCount[0]);
+    const uint32_t maxWg = uint32_t(std::min<uint64_t>({1024, floorPow2(props_.limits.maxComputeWorkGroupInvocations),
+                                                        floorPow2(props_.limits.maxComputeWorkGroupSize[0])}));
+    const bool texelOk = chunkBytes_ / 16 <= props_.limits.maxTexelBufferElements;
+
+    // --- descriptor sets with the storage buffer, the result buffer and a texel view ---
+    struct Res {
+        VkDevice d = VK_NULL_HANDLE;
+        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+        VkPipelineLayout pl = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        std::vector<VkDescriptorSet> sets;
+        std::vector<VkBufferView> views;
+        std::map<std::array<uint32_t, 5>, VkPipeline> pipes;
+        ~Res() {
+            vkDeviceWaitIdle(d);
+            for (auto& p : pipes)
+                if (p.second) vkDestroyPipeline(d, p.second, nullptr);
+            for (VkBufferView v : views) vkDestroyBufferView(d, v, nullptr);
+            if (pool) vkDestroyDescriptorPool(d, pool, nullptr);
+            if (pl) vkDestroyPipelineLayout(d, pl, nullptr);
+            if (dsl) vkDestroyDescriptorSetLayout(d, dsl, nullptr);
+        }
+    } res;
+    res.d = dev_;
+    {
+        const uint32_t nb = texelOk ? 3 : 2;
+        VkDescriptorSetLayoutBinding b[3] = {};
+        for (uint32_t i = 0; i < nb; ++i) {
+            b[i].binding = i;
+            b[i].descriptorType = i == 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[i].descriptorCount = 1;
+            b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dl.bindingCount = nb;
+        dl.pBindings = b;
+        VK_CHECK(vkCreateDescriptorSetLayout(dev_, &dl, nullptr, &res.dsl));
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push)};
+        VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        plci.setLayoutCount = 1;
+        plci.pSetLayouts = &res.dsl;
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges = &pcr;
+        VK_CHECK(vkCreatePipelineLayout(dev_, &plci, nullptr, &res.pl));
+        const uint32_t n = uint32_t(chunks_.size());
+        VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * n},
+                                      {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, n}};
+        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpci.maxSets = n;
+        dpci.poolSizeCount = texelOk ? 2 : 1;
+        dpci.pPoolSizes = ps;
+        VK_CHECK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &res.pool));
+        for (auto& ch : chunks_) {
+            VkDescriptorSet set;
+            VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            dai.descriptorPool = res.pool;
+            dai.descriptorSetCount = 1;
+            dai.pSetLayouts = &res.dsl;
+            VK_CHECK(vkAllocateDescriptorSets(dev_, &dai, &set));
+            res.sets.push_back(set);
+            VkBufferView view = VK_NULL_HANDLE;
+            if (texelOk) {
+                VkBufferViewCreateInfo vci{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
+                vci.buffer = ch.buf;
+                vci.format = VK_FORMAT_R32G32B32A32_UINT;
+                vci.range = chunkBytes_;
+                VK_CHECK(vkCreateBufferView(dev_, &vci, nullptr, &view));
+                res.views.push_back(view);
+            }
+            VkDescriptorBufferInfo bi[2] = {{ch.buf, 0, VK_WHOLE_SIZE}, {outBuf_, 0, VK_WHOLE_SIZE}};
+            VkWriteDescriptorSet w[3] = {};
+            for (uint32_t i = 0; i < nb; ++i) {
+                w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w[i].dstSet = set;
+                w[i].dstBinding = i;
+                w[i].descriptorCount = 1;
+                w[i].descriptorType = i == 2 ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                if (i == 2) w[i].pTexelBufferView = &view;
+                else w[i].pBufferInfo = &bi[i];
+            }
+            vkUpdateDescriptorSets(dev_, nb, w, 0, nullptr);
+        }
+    }
+
+    struct Cfg {
+        uint32_t threads, wg, unroll, vpl, line, sg;  // sg 0 = driver's choice
+        uint64_t window;
+        bool texel;
+        auto tie() const { return std::make_tuple(threads, wg, unroll, vpl, line, sg, window, texel); }
+    };
+
+    auto pipeFor = [&](const Cfg& c) -> VkPipeline {
+        const std::array<uint32_t, 5> k = {c.wg, c.unroll, c.vpl, c.texel ? 1u : 0u, c.sg};
+        auto it = res.pipes.find(k);
+        if (it != res.pipes.end()) return it->second;
+        VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smci.codeSize = c.texel ? sizeof kReadTuneTexelSpv : sizeof kReadTuneSsboSpv;
+        smci.pCode = c.texel ? kReadTuneTexelSpv : kReadTuneSsboSpv;
+        VkShaderModule sm;
+        VK_CHECK(vkCreateShaderModule(dev_, &smci, nullptr, &sm));
+        uint32_t spec[3] = {c.wg, c.unroll, c.vpl};
+        VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+        VkSpecializationInfo si{3, me, sizeof spec, spec};
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rs{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+        rs.requiredSubgroupSize = c.sg;
+        VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        if (c.sg) cpi.stage.pNext = &rs;
+        cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpi.stage.module = sm;
+        cpi.stage.pName = "main";
+        cpi.stage.pSpecializationInfo = &si;
+        cpi.layout = res.pl;
+        if (statsExt_) cpi.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+        VkPipeline p = VK_NULL_HANDLE;
+        VkResult r = vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpi, nullptr, &p);
+        vkDestroyShaderModule(dev_, sm, nullptr);
+        if (r != VK_SUCCESS) {
+            log("  (pipeline wg %u unroll %u vpl %u %s sg %u: VkResult %d)", c.wg, c.unroll, c.vpl,
+                c.texel ? "texel" : "ssbo", c.sg, (int)r);
+            p = VK_NULL_HANDLE;
+        }
+        res.pipes[k] = p;
+        return p;
+    };
+
+    // Invocations actually used: at most one per UNROLL * VPL uvec4 of a window and within
+    // the workgroup count limit.
+    auto shape = [&](const Cfg& c, uint32_t& T, uint32_t& iters) {
+        const uint64_t vecs = c.window / 16;
+        uint64_t t = std::min<uint64_t>({c.threads, vecs / (uint64_t(c.unroll) * c.vpl), c.wg * maxGroups});
+        t = std::max<uint64_t>(t, c.wg);
+        T = uint32_t(t);
+        iters = uint32_t(vecs / (t * c.vpl));
+    };
+
+    // One run over the whole set: one dispatch per window, a barrier between windows.
+    auto runOnce = [&](const Cfg& c, VkPipeline p, uint32_t pattern) {
+        uint32_t T, iters;
+        shape(c, T, iters);
+        const uint64_t vecs = c.window / 16, perChunk = chunkBytes_ / c.window, nWin = chunks_.size() * perChunk;
+        const uint32_t lb = log2u(c.window / c.line);
+        JobResult r = submitTimed([&] {
+            vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+            for (uint64_t w = 0; w < nWin; ++w) {
+                if (w) computeBarrier();
+                const uint64_t ch = w / perChunk, off = (w % perChunk) * c.window;
+                Push pc{};
+                pc.chunkWordBase = uint32_t(ch * (chunkBytes_ / 4) + off / 4);
+                pc.logicalBase = uint32_t(w * vecs);
+                pc.linesMask = (1u << lb) - 1u;
+                pc.linesBits = lb;
+                pc.vplShift = log2u(c.line / 16);
+                pc.pattern = pattern;
+                pc.seedMix = curSeedMix_;
+                pc.outSlot = 0;
+                deriveKey(rkey, uint32_t(w), pc.keyA);
+                pc.itersPerThread = iters;
+                pc.numThreads = T;
+                pc.dstVecOffset = uint32_t(off / 16);
+                vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, res.pl, 0, 1, &res.sets[ch], 0, nullptr);
+                vkCmdPushConstants(cmd_, res.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+                vkCmdDispatch(cmd_, T / c.wg, 1, 1);
+            }
+        });
+        r.wgExpected = uint32_t(nWin * (T / c.wg));
+        return r;
+    };
+
+    // CPU reference: depends on the window, line size and pattern only (not on the shape).
+    std::map<std::array<uint64_t, 3>, std::array<uint32_t, 2>> refs;
+    auto refFor = [&](const Cfg& c, uint32_t pattern) {
+        const std::array<uint64_t, 3> k = {c.window, c.line, pattern};
+        auto it = refs.find(k);
+        if (it != refs.end()) return it->second;
+        const uint64_t vecs = c.window / 16, perChunk = chunkBytes_ / c.window;
+        const uint32_t lb = log2u(c.window / c.line), vs = log2u(c.line / 16);
+        std::array<uint32_t, 2> out;
+        refChecksum(uint32_t(chunks_.size() * perChunk), vecs,
+                    [&](uint32_t w, ref::Params& p, uint32_t& wordBase, uint32_t& logicalBase) {
+                        p = {(1u << lb) - 1u, lb, vs, pattern, curSeedMix_, {}};
+                        deriveKey(rkey, w, p.keyA);
+                        wordBase = uint32_t((w / perChunk) * (chunkBytes_ / 4) + (w % perChunk) * c.window / 4);
+                        logicalBase = uint32_t(w * vecs);
+                    },
+                    out.data());
+        refs[k] = out;
+        return out;
+    };
+
+    struct Pt {
+        bool ran = false, ok = false;
+        uint32_t T = 0;
+        double med = 0;
+        std::vector<double> runs;
+    };
+    bool allOk = true;
+    int mismatches = 0;
+    auto point = [&](const Cfg& c, uint32_t pattern, int reps) {
+        Pt pt;
+        VkPipeline p = pipeFor(c);
+        if (!p) return pt;
+        const auto ref = refFor(c, pattern);
+        uint32_t iters;
+        shape(c, pt.T, iters);
+        pt.ok = true;
+        for (int i = 0; i <= reps; ++i) {  // run 0 is discarded (but checked)
+            JobResult r = runOnce(c, p, pattern);
+            pt.ok &= r.chkX == ref[0] && r.chkY == ref[1] && r.wgDone == r.wgExpected;
+            if (i) pt.runs.push_back(double(setBytes) / (r.ms() * 1e6));
+        }
+        pt.ran = true;
+        pt.med = median(pt.runs);
+        if (!pt.ok) {
+            allOk = false;
+            ++mismatches;
+        }
+        return pt;
+    };
+
+    auto cfgStr = [&](const Cfg& c, uint32_t T) {
+        return (T ? fmt("T %7u  ", T) : std::string()) + fmt("wg %4u  unroll %2u  %2u B/lane  %-5s  sg %-3s  win %3llu MiB  line %u B", c.wg, c.unroll,
+                   16 * c.vpl, c.texel ? "texel" : "ssbo", c.sg ? fmt("%u", c.sg).c_str() : "def",
+                   (unsigned long long)(c.window / kMiB), c.line);
+    };
+
+    log("");
+    log("[RAND TUNE] random read inside a TLB-sized window: which kernel / dispatch shape is fastest?");
+    log("  every row: whole %llu MiB set, one dispatch per window, every run checked against the CPU reference",
+        (unsigned long long)(setBytes / kMiB));
+    log("  T = invocations per dispatch, unroll = random lines in flight per invocation, B/lane = bytes one");
+    log("  invocation loads per line, texel = texture pipe instead of storage buffer, sg = subgroup size");
+    if (!texelOk)
+        log("  texel path skipped: chunk of %llu texels > maxTexelBufferElements %u",
+            (unsigned long long)(chunkBytes_ / 16), props_.limits.maxTexelBufferElements);
+    const auto clocks = cpu::findClockFiles();
+    cpu::ClockSampler sampler(clocks);
+    sampler.start();
+    prewarm();
+
+    // --- sequential reference ---
+    const uint64_t win0 = o_.windowMB ? chunkBytes_ : std::min<uint64_t>(64 * kMiB, chunkBytes_);
+    Cfg base{o_.threads ? uint32_t(threadCap_) : (1u << 18), o_.wg, 4, 1, line0, 0, win0, false};
+    double seqPeak = 0;
+    {
+        setConfig(o_.wg, 1u << 20, line0);
+        Job j = readJob(kSeq, 0);
+        Stat s = timeJob(j, jobBytes(j), 3);
+        Cfg sc = base;
+        sc.threads = 1u << 20;
+        Pt t = point(sc, kSeq, 3);
+        seqPeak = std::max(s.med, t.med);
+        log("");
+        log("  READ seq reference: read.comp %.2f GB/s, tuning kernel %.2f GB/s (1M invocations) -> %.2f GB/s = 100%%",
+            s.med, t.med, seqPeak);
+    }
+    log("");
+    log("  %-12s %7s %10s %6s  %s", "", "GB/s", "M acc/s", "% seq", "configuration");
+    auto row = [&](const std::string& label, const Cfg& c, const Pt& pt) {
+        if (!pt.ran) {
+            log("  %-12s pipeline not available: %s", label.c_str(), cfgStr(c, 0).c_str());
+            return;
+        }
+        log("  %-12s %7.2f %10.0f %5.1f%%  %s%s", label.c_str(), pt.med, pt.med * 1e3 / c.line,
+            100.0 * pt.med / seqPeak, cfgStr(c, pt.T).c_str(), pt.ok ? "" : "  CHECKSUM MISMATCH");
+    };
+
+    Cfg best = base;
+    Pt basePt = point(base, kRand, 3);
+    row("v1.8 shape", base, basePt);
+
+    // Measures the candidates round-robin (3 rounds x 2 runs, so a clock drift hits all of
+    // them alike); adopts the fastest one if it beats the current best of this section by
+    // > 3% (noise), or if the current best is not among the candidates.
+    auto section = [&](const char* title, const std::vector<std::pair<std::string, Cfg>>& cands, bool adopt) {
+        log("  -- %s", title);
+        std::vector<Pt> pts(cands.size());
+        for (int round = 0; round < 3; ++round)
+            for (size_t i = 0; i < cands.size(); ++i) {
+                if (round && !pts[i].ran) continue;
+                Pt p = point(cands[i].second, kRand, 2);
+                Pt& a = pts[i];
+                a.ok = (round ? a.ok : true) && p.ok;
+                a.ran = p.ran;
+                a.T = p.T;
+                a.runs.insert(a.runs.end(), p.runs.begin(), p.runs.end());
+                a.med = median(a.runs);
+            }
+        double cur = -1, top = 0;
+        Cfg topCfg = best;
+        for (size_t i = 0; i < cands.size(); ++i) {
+            const auto& cd = cands[i];
+            const Pt& pt = pts[i];
+            row(cd.first, cd.second, pt);
+            if (!pt.ran || !pt.ok) continue;
+            if (cd.second.tie() == best.tie()) cur = pt.med;
+            if (pt.med > top) {
+                top = pt.med;
+                topCfg = cd.second;
+            }
+        }
+        if (!adopt || top <= 0) return;
+        if (cur < 0 || top > cur * 1.03) best = topCfg;
+        log("     keep: %s", cfgStr(best, 0).c_str());
+    };
+
+    log("");
+    {
+        std::vector<std::pair<std::string, Cfg>> v;
+        uint32_t lastT = 0;
+        for (uint32_t t = 1u << 16; t <= (1u << 22); t *= 2) {
+            Cfg c = best;
+            c.threads = t;
+            uint32_t T, iters;
+            shape(c, T, iters);
+            if (T == lastT) continue;  // capped by the window: same dispatch
+            lastT = T;
+            v.push_back({fmt("T %uK", T / 1024), c});
+        }
+        section("invocations (memory-level parallelism of the GPU)", v, true);
+    }
+    {
+        std::vector<std::pair<std::string, Cfg>> v;
+        for (uint32_t w = 64; w <= maxWg; w *= 2) {
+            Cfg c = best;
+            c.wg = w;
+            v.push_back({fmt("wg %u", w), c});
+        }
+        section("workgroup size", v, true);
+    }
+    {
+        std::vector<std::pair<std::string, Cfg>> v;
+        for (uint32_t u = 1; u * best.vpl <= 16; u *= 2) {
+            Cfg c = best;
+            c.unroll = u;
+            v.push_back({fmt("unroll %u", u), c});
+        }
+        section("random lines in flight per invocation", v, true);
+    }
+    {
+        std::vector<std::pair<std::string, Cfg>> v;
+        for (uint32_t p = 1; p <= 4 && 16 * p <= best.line; p *= 2) {
+            Cfg c = best;
+            c.vpl = p;
+            c.unroll = std::max(1u, std::min(best.unroll, 16u / p));
+            v.push_back({fmt("%u B/lane", 16 * p), c});
+        }
+        section("bytes per lane (lanes per line = line / this)", v, true);
+    }
+    if (texelOk) {
+        std::vector<std::pair<std::string, Cfg>> v;
+        for (bool t : {false, true}) {
+            Cfg c = best;
+            c.texel = t;
+            v.push_back({t ? "texel buf" : "storage buf", c});
+        }
+        section("load path", v, true);
+    }
+    if (sgCtl_.avail) {
+        std::vector<std::pair<std::string, Cfg>> v;
+        Cfg c0 = best;
+        c0.sg = 0;
+        v.push_back({fmt("sg default"), c0});
+        for (uint32_t s = sgCtl_.minSize; s <= sgCtl_.maxSize; s *= 2) {
+            if (!isPow2(s) || best.wg > uint64_t(s) * sgCtl_.maxSubgroups) continue;
+            Cfg c = best;
+            c.sg = s;
+            v.push_back({fmt("sg %u", s), c});
+        }
+        section(fmt("subgroup size (default %u)", subgroupSize_).c_str(), v, true);
+    } else {
+        log("  -- subgroup size: not selectable on this device (default %u lanes)", subgroupSize_);
+    }
+    {
+        // Every line is read once per window, so a small window gives no cache reuse; it
+        // does concentrate the accesses on fewer DRAM rows (more row-buffer hits) and makes
+        // each dispatch shorter. Only windows >= 16 MiB are adopted.
+        std::vector<std::pair<std::string, Cfg>> small, v;
+        for (uint64_t w = 4 * kMiB; w <= chunkBytes_ && w <= setBytes; w *= 2) {
+            Cfg c = best;
+            c.window = w;
+            (w < 16 * kMiB ? small : v).push_back({fmt("win %llu MiB", (unsigned long long)(w / kMiB)), c});
+        }
+        if (!small.empty()) section("window size < 16 MiB (information: fewer DRAM rows)", small, false);
+        section("window size", v, true);
+    }
+    {
+        std::vector<std::pair<std::string, Cfg>> v;
+        for (uint32_t ln = 32; ln <= 256; ln *= 2) {
+            Cfg c = best;
+            c.line = ln;
+            c.vpl = std::min(best.vpl, ln / 16);
+            c.unroll = std::min(best.unroll, 16u / c.vpl);
+            v.push_back({fmt("line %u B", ln), c});
+        }
+        section("access size (information: GB/s at other line sizes, not adopted)", v, false);
+    }
+
+    // --- final: best shape with more runs, the v1.8 shape again (drift), sequential ---
+    log("");
+    log("  -- final (%d runs each)", std::max(o_.reps, 5));
+    Pt fin = point(best, kRand, std::max(o_.reps, 5));
+    row("best rand", best, fin);
+    Pt again = point(base, kRand, std::max(o_.reps, 5));
+    row("v1.8 again", base, again);
+    Cfg bs = best;
+    Pt seqBest = point(bs, kSeq, 3);
+    row("best as seq", bs, seqBest);
+    seqPeak = std::max(seqPeak, seqBest.med);  // the final ratios use the best sequential seen
+    rows_.push_back({"rand v1.8 shape", again.runs, again.ok});
+    rows_.push_back({"rand tuned", fin.runs, fin.ok});
+    if (statsExt_) {
+        log("");
+        log("  driver statistics of the two kernels:");
+        printPipelineStats(pipeFor(base), "v1.8 shape");
+        printPipelineStats(pipeFor(best), "best rand");
+    }
+    log("  clocks during the tuning: %s", clocks.empty() ? "(no readable clock files)" : sampler.stop().c_str());
+
+    log("");
+    log("==================================== RAND TUNE ====================================");
+    verdict(allOk ? "PASS" : "FAIL",
+            allOk ? std::string("all tuning runs gave the CPU reference checksum")
+                  : fmt("%d measurement(s) gave a wrong checksum or dropped workgroups", mismatches));
+    log("  READ seq reference %.2f GB/s", seqPeak);
+    log("  v1.8 shape  %.2f GB/s (%.1f%% of seq)", again.med, 100.0 * again.med / seqPeak);
+    log("  best shape  %.2f GB/s (%.1f%% of seq, x%.2f)   %s", fin.med, 100.0 * fin.med / seqPeak,
+        again.med > 0 ? fin.med / again.med : 0.0, cfgStr(best, fin.T).c_str());
+    log("  reproduce the window with: --window-mb %llu --threads %u --wg %u",
+        (unsigned long long)(best.window / kMiB), fin.T, best.wg);
+    log("  RAND TUNE time: %.0f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
+}
+
 int Bench::summary() {
     log("");
     log("==================================== SUMMARY ====================================");
@@ -2551,9 +3075,9 @@ int Bench::run() {
     initVulkan();
     createResources();
     log("Seed           : %u  (reproduce with --seed %u)", seed_, seed_);
-    if (!o_.peak && !o_.cpu && !o_.dvfs && !o_.matrix) log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
+    if (!o_.peak && !o_.cpu && !o_.dvfs && !o_.matrix && !o_.randTune) log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
         o_.warmup, o_.warmupMs);
-    if (!o_.peak && !o_.cpu && !o_.dvfs && !o_.matrix && o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
+    if (!o_.peak && !o_.cpu && !o_.dvfs && !o_.matrix && !o_.randTune && o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
         log("Boost          : %.0f ms %s load before the tests", o_.boostMs,
             o_.boostCpu && o_.boostGpu ? "CPU + GPU GEMM" : o_.boostCpu ? "CPU" : "GPU GEMM");
     if (o_.injectFault)
@@ -2564,8 +3088,9 @@ int Bench::run() {
     log("[INIT] filling the working set with seed-dependent pseudo-random data");
     fill(ref::hash32(seed_));
     verdict(verifyContent(curSeedMix_, "init") ? "PASS" : "FAIL", "initial memory content verified on the GPU");
-    if (o_.peak || o_.cpu || o_.dvfs || o_.matrix) {
-        if (o_.matrix) matrix();
+    if (o_.peak || o_.cpu || o_.dvfs || o_.matrix || o_.randTune) {
+        if (o_.randTune) randTune();
+        else if (o_.matrix) matrix();
         else if (o_.dvfs) dvfs();
         else if (o_.peak) peak();
         else cpuRand();
@@ -2626,6 +3151,9 @@ std::string usage() {
            "                   the footprint sweep idle / loaded (~1 min)\n"
            "  --matrix         random read whose data feeds matrix multiplies (cooperative\n"
            "                   matrix, ALU fallback), matrix work swept 0..64 reps\n"
+           "  --rand-tune      random read tuning inside a 64 MiB window (or --window-mb):\n"
+           "                   invocations, workgroup, lines in flight per invocation, bytes\n"
+           "                   per lane, storage vs texel buffer, subgroup size, window, line\n"
            "  --no-checks      skip the anti-optimisation checks\n"
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
@@ -2674,6 +3202,7 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--cpu") o.cpu = true;
         else if (k == "--dvfs") o.dvfs = true;
         else if (k == "--matrix") o.matrix = true;
+        else if (k == "--rand-tune") o.randTune = true;
         else if (k == "--no-checks") o.checks = false;
         else if (k == "--no-cpu-ref") o.cpuRef = false;
         else if (k == "--inject-fault") o.injectFault = true;

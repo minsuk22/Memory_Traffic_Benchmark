@@ -7,7 +7,7 @@
 
 namespace mb {
 
-constexpr const char* kVersion = "1.8";
+constexpr const char* kVersion = "1.9";
 
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set
@@ -33,6 +33,7 @@ struct Options {
     bool     cpu       = false; // CPU random read peak (same addresses/data/checksum as the GPU)
     bool     dvfs      = false; // random read vs memory clock governors (background traffic, slices, footprint)
     bool     matrix    = false; // random read feeding matrix math (cooperative matrix or ALU)
+    bool     randTune  = false; // random read tuning inside a TLB-sized window (kernel shape, dispatch, load path)
     double   peakGBps  = 0;     // theoretical DRAM peak, 0 = unknown
     uint32_t seed      = 0;     // 0 = random per run
     uint32_t threads   = 0;     // invocations per dispatch, 0 = auto
