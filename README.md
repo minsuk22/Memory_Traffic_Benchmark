@@ -68,6 +68,7 @@ Options (`membench --help`):
 | `--sweep` | off | working-set sweep 64 KiB → chunk size: shows the cache → DRAM cliff |
 | `--peak` | off | peak finder (~2.5 min, see below) instead of the normal tests |
 | `--cpu` | off | CPU random read peak (see below) instead of the normal tests |
+| `--dvfs` | off | random read vs memory clock governors (see below) instead of the normal tests |
 | `--seed N` | random | reproduce a run exactly |
 | `--no-cpu-ref` | – | skip CPU reference checksums (faster, weaker) |
 | `--inject-fault` | – | self-test: kernels silently skip part of their work → the checks must FAIL |
@@ -156,6 +157,19 @@ bytes should equal the reported traffic (for 64 B lines).
   (GPU and CPU bandwidth plus dependent-load CPU latency) and a run with `MADV_HUGEPAGE`. The
   smallest footprint is cache resident, so its CPU number is the compute ceiling of the
   address + checksum loop.
+* Random read vs clock governors (`--dvfs`, app button **Rand vs DVFS**, ~1 min): the DDR /
+  bus governors pick the memory clocks from the *measured bandwidth*, and a random read moves
+  few bytes per second, so it may run at low memory clocks. The same verified random read is
+  measured
+  * **A** while 1..all CPU cores stream-read another 256 MiB buffer (idle again at the end),
+  * **B** split into 16 slices per chunk with GPU sequential reads of 16 MiB .. 256 MiB between
+    the slices (one submission, every random slice timed on the GPU, slices together must
+    give the CPU reference checksum),
+  * **C** over footprints 16 MiB .. 1 GiB, idle / with background load / idle again.
+
+  A large gain in A or B means the governors limit the random read; a footprint cliff that
+  stays with the clocks up means GPU address translation (TLB reach) does. Clock files
+  (`/sys/class/devfreq/*/cur_freq`, kgsl `gpuclk`) are sampled when the app may read them.
 
 ## 6. Results
 

@@ -15,6 +15,7 @@
 #ifdef _WIN32
 #include <malloc.h>
 #else
+#include <dirent.h>
 #include <sys/mman.h>
 #endif
 
@@ -27,6 +28,7 @@ constexpr uint64_t kHuge = 2ull << 20;
 // Read once per run: the compiler cannot know it is 0, so `x & gZero` keeps a real data
 // dependency in the latency test without changing any address.
 volatile uint32_t gZero = 0;
+std::atomic<uint64_t> gSink{0};
 
 inline void mix(uint32_t& a0, uint32_t& a1, const uint32_t* v, uint32_t G) {
     a0 += (v[0] ^ G) + ref::rotl(v[1], 7u) + ref::rotl(v[2], 13u) + ref::rotl(v[3], 19u);
@@ -219,6 +221,113 @@ std::string hugePageInfo() {
             }
     }
     return "THP mode: " + mode + ", AnonHugePages of this process: " + anon;
+}
+
+void StreamLoad::start(const uint32_t* words, uint64_t bytes, unsigned threads) {
+    stop();
+    stop_ = false;
+    bytes_ = 0;
+    const uint64_t block = 1ull << 20;
+    const uint64_t blocks = bytes / block;
+    for (unsigned t = 0; t < threads; ++t)
+        th_.emplace_back([=] {
+            const uint64_t* w = reinterpret_cast<const uint64_t*>(words);
+            const uint64_t b0 = blocks * t / threads, b1 = std::max(b0 + 1, blocks * (t + 1) / threads);
+            uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            for (uint64_t b = b0; !stop_.load(std::memory_order_relaxed); b = b + 1 < b1 ? b + 1 : b0) {
+                const uint64_t* p = w + b * (block / 8);
+                for (uint64_t i = 0; i < block / 8; i += 4) {
+                    s0 += p[i];
+                    s1 ^= p[i + 1];
+                    s2 += p[i + 2];
+                    s3 ^= p[i + 3];
+                }
+                bytes_.fetch_add(block, std::memory_order_relaxed);
+            }
+            gSink.fetch_xor(s0 + s1 + s2 + s3, std::memory_order_relaxed);  // keeps the loads alive
+        });
+    mark();
+}
+
+void StreamLoad::stop() {
+    stop_ = true;
+    for (auto& t : th_) t.join();
+    th_.clear();
+}
+
+void StreamLoad::mark() {
+    markBytes_ = bytes_.load();
+    markT_ = std::chrono::steady_clock::now();
+}
+
+double StreamLoad::gbpsSinceMark() const {
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - markT_).count();
+    return s > 0 ? double(bytes_.load() - markBytes_) / (s * 1e9) : 0.0;
+}
+
+namespace {
+bool readNumber(const std::string& path, double& v) {
+    std::ifstream f(path);
+    return bool(f >> v);
+}
+}  // namespace
+
+std::vector<ClockFile> findClockFiles() {
+    std::vector<ClockFile> out;
+    double v;
+#ifndef _WIN32
+    const ClockFile kgsl[] = {{"gpuclk", "/sys/class/kgsl/kgsl-3d0/gpuclk"},
+                              {"kgsl devfreq", "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq"}};
+    for (const ClockFile& f : kgsl)
+        if (readNumber(f.path, v)) out.push_back(f);
+    if (DIR* d = opendir("/sys/class/devfreq")) {
+        while (dirent* e = readdir(d)) {
+            if (e->d_name[0] == '.') continue;
+            std::string path = std::string("/sys/class/devfreq/") + e->d_name + "/cur_freq";
+            if (readNumber(path, v)) out.push_back({e->d_name, path});
+        }
+        closedir(d);
+    }
+#else
+    (void)v;
+#endif
+    return out;
+}
+
+void ClockSampler::start() {
+    stop();
+    stop_ = false;
+    range_.assign(files_.size(), {1e300, 0.0});
+    if (files_.empty()) return;
+    th_ = std::thread([this] {
+        while (!stop_.load()) {
+            for (size_t i = 0; i < files_.size(); ++i) {
+                double v;
+                if (!readNumber(files_[i].path, v)) continue;
+                range_[i].first = std::min(range_[i].first, v);
+                range_[i].second = std::max(range_[i].second, v);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    });
+}
+
+std::string ClockSampler::stop() {
+    stop_ = true;
+    if (th_.joinable()) th_.join();
+    std::string s;
+    for (size_t i = 0; i < range_.size(); ++i) {
+        if (range_[i].second <= 0) continue;
+        // Hz values are shown in MHz; bandwidth-vote devices (MB/s, kHz) are shown as read.
+        const bool hz = range_[i].second >= 1e7;
+        const double div = hz ? 1e6 : 1.0;
+        char buf[160];
+        snprintf(buf, sizeof buf, "%s%s %.0f-%.0f%s", s.empty() ? "" : ", ", files_[i].name.c_str(),
+                 range_[i].first / div, range_[i].second / div, hz ? " MHz" : "");
+        s += buf;
+    }
+    range_.clear();
+    return s;
 }
 
 }  // namespace cpu

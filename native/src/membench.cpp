@@ -181,6 +181,13 @@ private:
     bool checkRead(uint32_t pattern, const char* what);
     void peak();
     void cpuRand();
+    struct SliceRun {
+        double randMs = 0, totalMs = 0;  // GPU time of the random slices / of the whole submission
+        uint32_t chk[2] = {0, 0};
+        bool ok = true;  // all workgroups ran
+    };
+    SliceRun sliced(const Job& rnd, uint32_t slices, uint64_t seqBytes);
+    void dvfs();
     int summary();
 
     Options o_;
@@ -222,6 +229,8 @@ private:
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
     VkQueryPool qpool_ = VK_NULL_HANDLE;
+    VkQueryPool qpoolMany_ = VK_NULL_HANDLE;  // per-slice timestamps (--dvfs)
+    uint32_t qpoolManySize_ = 0;
 
     // Cooperative-matrix configuration for the boost GEMM (VK_KHR_cooperative_matrix).
     struct CoopCfg {
@@ -723,6 +732,7 @@ void Bench::destroy() {
         for (VkPipeline p : {pRead_, pReadDead_, pWrite_, pCopy_, pVerify_})
             if (p) vkDestroyPipeline(dev_, p, nullptr);
         if (qpool_) vkDestroyQueryPool(dev_, qpool_, nullptr);
+        if (qpoolMany_) vkDestroyQueryPool(dev_, qpoolMany_, nullptr);
         if (fence_) vkDestroyFence(dev_, fence_, nullptr);
         if (cmdPool_) vkDestroyCommandPool(dev_, cmdPool_, nullptr);
         if (pool_) vkDestroyDescriptorPool(dev_, pool_, nullptr);
@@ -2014,6 +2024,325 @@ void Bench::cpuRand() {
         std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
 }
 
+// ---------------------------------------------------------------------------------------
+// Random read vs clock governors (--dvfs). The DDR / bus governors raise the memory clocks
+// from the *measured bandwidth*. A random read moves few bytes per second, so it may run at
+// low memory clocks, and page-table walks suffer most from the higher latency. Three ways to
+// keep the clocks up while measuring the same random read:
+//   A) CPU cores stream-read another buffer in the background,
+//   B) the GPU itself alternates random slices with sequential reads (one submission),
+//   C) the footprint sweep without and with the background load.
+// If the random read gains a lot, the governor is the limit; if it does not and the
+// footprint cliff stays, GPU address translation is.
+// ---------------------------------------------------------------------------------------
+
+// Random read of the whole working set, split into `slices` dispatches per chunk. Before each
+// slice a sequential read of `seqBytes` (0 = none) of another chunk keeps the GPU's DRAM
+// traffic high. Barriers keep the dispatches apart; every random slice is timed on the GPU.
+// The slices together produce the checksum of `rnd`.
+Bench::SliceRun Bench::sliced(const Job& rnd, uint32_t slices, uint64_t seqBytes) {
+    if (!tsBits_) throw std::runtime_error("sliced run needs GPU timestamps");
+    const uint64_t vecs = vecsPerChunk(rnd);
+    const uint64_t sliceVecs = vecs / slices;
+    const uint64_t T = std::min<uint64_t>(sliceVecs / rnd.unroll, threadCap_);
+    if (T < o_.wg || sliceVecs % T) throw std::runtime_error("slice too small");
+    const uint32_t groups = uint32_t(T / o_.wg), iters = uint32_t(sliceVecs / T);
+    const uint64_t chunkVecs = 1ull << (chunkLinesBits_ + vplShift_);
+    const uint64_t seqVecs = std::min<uint64_t>(seqBytes / 16, chunkVecs);
+    const uint64_t Ts = seqVecs ? std::min<uint64_t>(seqVecs / 4, threadCap_) : 0;
+    const uint32_t n = rnd.numChunks;
+
+    const uint32_t nq = 2 * slices * n + 2;
+    if (nq > qpoolManySize_) {
+        if (qpoolMany_) vkDestroyQueryPool(dev_, qpoolMany_, nullptr);
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = nq;
+        VK_CHECK(vkCreateQueryPool(dev_, &qpci, nullptr, &qpoolMany_));
+        qpoolManySize_ = nq;
+    }
+    for (int i = 0; i < 8; ++i) outMap_[i] = 0;
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkResetCommandBuffer(cmd_, 0));
+    VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
+    VkMemoryBarrier mbar{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
+    mbar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mbar, 0, nullptr, 0, nullptr);
+    vkCmdResetQueryPool(cmd_, qpoolMany_, 0, nq);
+    vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpoolMany_, 0);
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, rnd.pipe);
+    auto apart = [&] {  // the next dispatch starts after the previous one has finished
+        VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                             &b, 0, nullptr, 0, nullptr);
+    };
+    uint32_t q = 2, seqGroups = 0;
+    for (uint32_t c = 0; c < n; ++c) {
+        for (uint32_t s = 0; s < slices; ++s) {
+            if (seqVecs) {
+                const uint32_t sc = (c + 1) % uint32_t(chunks_.size());
+                Push ps{};
+                ps.chunkWordBase = uint32_t(sc * (chunkBytes_ / 4));
+                ps.linesMask = (1u << chunkLinesBits_) - 1u;
+                ps.linesBits = chunkLinesBits_;
+                ps.vplShift = vplShift_;
+                ps.pattern = kSeq;
+                ps.seedMix = rnd.seedMix;
+                ps.outSlot = 1;
+                ps.itersPerThread = uint32_t(seqVecs / Ts);
+                ps.numThreads = uint32_t(Ts);
+                ps.dstVecOffset = uint32_t((uint64_t(c * slices + s) * seqVecs) % chunkVecs);
+                vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pl_, 0, 1, &chunks_[sc].set, 0,
+                                        nullptr);
+                vkCmdPushConstants(cmd_, pl_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof ps, &ps);
+                vkCmdDispatch(cmd_, uint32_t(Ts / o_.wg), 1, 1);
+                seqGroups += uint32_t(Ts / o_.wg);
+            }
+            apart();
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, qpoolMany_, q++);
+            Push pc{};
+            pc.chunkWordBase = uint32_t(c * (chunkBytes_ / 4));
+            pc.logicalBase = uint32_t(c * vecs);
+            pc.linesMask = (1u << rnd.linesBits) - 1u;
+            pc.linesBits = rnd.linesBits;
+            pc.vplShift = vplShift_;
+            pc.pattern = rnd.pattern;
+            pc.seedMix = rnd.seedMix;
+            pc.outSlot = 0;
+            deriveKey(rnd.keyBaseA, c, pc.keyA);
+            pc.itersPerThread = iters;
+            pc.numThreads = uint32_t(T);
+            pc.dstVecOffset = uint32_t(uint64_t(s) * sliceVecs);
+            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pl_, 0, 1, &chunks_[c].set, 0, nullptr);
+            vkCmdPushConstants(cmd_, pl_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+            vkCmdDispatch(cmd_, groups, 1, 1);
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, qpoolMany_, q++);
+            apart();
+        }
+    }
+    vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpoolMany_, 1);
+    mbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mbar.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mbar, 0,
+                         nullptr, 0, nullptr);
+    VK_CHECK(vkEndCommandBuffer(cmd_));
+
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd_;
+    VK_CHECK(vkResetFences(dev_, 1, &fence_));
+    VK_CHECK(vkQueueSubmit(queue_, 1, &si, fence_));
+    VK_CHECK(vkWaitForFences(dev_, 1, &fence_, VK_TRUE, 120ull * 1000000000ull));
+
+    std::vector<uint64_t> ts(nq);
+    VK_CHECK(vkGetQueryPoolResults(dev_, qpoolMany_, 0, nq, nq * sizeof(uint64_t), ts.data(), sizeof(uint64_t),
+                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+    const uint64_t mask = tsBits_ >= 64 ? ~0ull : ((1ull << tsBits_) - 1);
+    const double toMs = props_.limits.timestampPeriod / 1e6;
+    SliceRun r;
+    r.totalMs = double((ts[1] - ts[0]) & mask) * toMs;
+    for (uint32_t i = 2; i < nq; i += 2) r.randMs += double((ts[i + 1] - ts[i]) & mask) * toMs;
+    r.chk[0] = outMap_[0];
+    r.chk[1] = outMap_[1];
+    r.ok = outMap_[2] == groups * slices * n && outMap_[6] == seqGroups;
+    return r;
+}
+
+void Bench::dvfs() {
+    const auto T0 = std::chrono::steady_clock::now();
+    const unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t line0 = o_.lineBytes;
+    setConfig(o_.wg, o_.threads ? uint32_t(threadCap_) : (1u << 20), line0);
+    const uint64_t setBytes = chunks_.size() * chunkBytes_;
+
+    log("");
+    log("[RAND vs DVFS] is the random read limited by the memory clock governors or by the GPU?");
+    log("  GPU: wg %u, %llu invocations, %u B lines, %llu MiB working set", o_.wg, (unsigned long long)threadCap_,
+        line0, (unsigned long long)(setBytes / kMiB));
+    const auto clocks = cpu::findClockFiles();
+    if (clocks.empty()) {
+        log("  clock files readable by the app: none (normal on production phones)");
+    } else {
+        std::string names;
+        for (auto& c : clocks) names += (names.empty() ? "" : ", ") + c.name;
+        log("  clock files readable by the app: %s", names.c_str());
+    }
+    cpu::ClockSampler sampler(clocks);
+    const uint64_t bgBytes = 256 * kMiB;
+    cpu::Buffer bg;
+    bg.allocate(bgBytes, false);
+    bg.fill(0x5EEDu, nt);
+
+    Job rnd = readJob(kRand, readKey_);
+    Job seq = readJob(kSeq, 0);
+    const double rb = jobBytes(rnd), sb = jobBytes(seq);
+    uint32_t refc[2];
+    cpuReference(rnd, refc);
+    {
+        JobResult r = execute(rnd);
+        bool ok = r.chkX == refc[0] && r.chkY == refc[1] && r.wgDone == r.wgExpected;
+        verdict(ok ? "PASS" : "FAIL", fmt("READ rand %uB: GPU checksum %08x:%08x %s CPU reference", line0, r.chkX,
+                                          r.chkY, ok ? "equals" : "DIFFERS FROM"));
+    }
+
+    // A) background CPU stream reads.
+    struct Pt {
+        unsigned bgT;
+        double bgGbps;
+        Stat rnd, seq;
+        std::string clk;
+    };
+    auto point = [&](unsigned bgT, const Job& rj, double rbytes, bool withSeq) {
+        Pt p{bgT, 0, {}, {}, {}};
+        cpu::StreamLoad load;
+        if (bgT) {
+            load.start(bg.words(), bgBytes, bgT);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));  // governor reaction time
+            load.mark();
+        }
+        sampler.start();
+        p.rnd = timeJob(rj, rbytes, 2);
+        p.clk = sampler.stop();
+        if (bgT) p.bgGbps = load.gbpsSinceMark();
+        if (withSeq) p.seq = timeJob(seq, sb, 3);
+        return p;
+    };
+    std::vector<unsigned> levels;
+    for (unsigned t : {0u, 1u, 2u, 4u, nt})
+        if (t <= nt && std::find(levels.begin(), levels.end(), t) == levels.end()) levels.push_back(t);
+    levels.push_back(0);  // idle again: did anything drift?
+    log("");
+    log("[A] GPU %llu MiB random read while CPU cores stream-read another 256 MiB buffer",
+        (unsigned long long)(setBytes / kMiB));
+    log("  %8s %9s %10s %9s %9s %9s  %s", "CPU load", "CPU GB/s", "GPU rand", "M acc/s", "GPU seq", "rand/seq",
+        clocks.empty() ? "" : "clocks during the random read");
+    std::vector<Pt> pa;
+    for (unsigned t : levels) {
+        Pt p = point(t, rnd, rb, true);
+        log("  %8s %9s %10.2f %9.1f %9.2f %8.1f%%  %s", t ? fmt("%u thr", t).c_str() : "off",
+            t ? fmt("%.1f", p.bgGbps).c_str() : "-", p.rnd.med, p.rnd.med * 1e3 / line0, p.seq.med,
+            100.0 * p.rnd.med / p.seq.med, p.clk.c_str());
+        pa.push_back(p);
+    }
+    const Pt& idleA = pa.front();
+    const Pt* bestA = &pa[1];  // best point with background load
+    for (auto& p : pa)
+        if (p.bgT && p.rnd.med > bestA->rnd.med) bestA = &p;
+    const double idleRand = 0.5 * (pa.front().rnd.med + pa.back().rnd.med);
+    const double gainA = bestA->rnd.med / std::max(1e-9, idleRand);
+    rows_.push_back({"READ rand idle", idleA.rnd.runs, idleA.rnd.ok});
+    if (bestA->bgT) rows_.push_back({fmt("READ rand +%u CPU", bestA->bgT), bestA->rnd.runs, bestA->rnd.ok});
+
+    // B) the GPU keeps its own DRAM traffic high between random slices.
+    const uint32_t slices = 16;
+    log("");
+    log("[B] GPU random read in %u slices per chunk, sequential GPU reads between the slices", slices);
+    log("  %14s %10s %9s %13s  %s", "between slices", "GPU rand", "M acc/s", "avg traffic", "checksum");
+    double randB0 = 0, bestB = 0;
+    uint64_t bestBSeq = 0;
+    bool okB = true;
+    std::vector<double> bestBRuns;
+    std::vector<uint64_t> seqSizes = {0, 16 * kMiB, 64 * kMiB};
+    if (chunkBytes_ > 64 * kMiB) seqSizes.push_back(chunkBytes_);
+    for (uint64_t sq : seqSizes) {
+        if (sq > chunkBytes_) continue;
+        std::vector<double> g;
+        double avg = 0;
+        bool ok = true;
+        for (int i = 0; i < 3; ++i) {
+            SliceRun r = sliced(rnd, slices, sq);
+            ok &= r.ok && r.chk[0] == refc[0] && r.chk[1] == refc[1];
+            if (!i) continue;  // first run: governor settles
+            g.push_back(rb / (r.randMs * 1e6));
+            avg = (rb + double(sq) * slices * rnd.numChunks) / (r.totalMs * 1e6);
+        }
+        const double m = median(g);
+        okB &= ok;
+        if (!sq) randB0 = m;
+        if (sq && m > bestB) { bestB = m; bestBSeq = sq; bestBRuns = g; }
+        log("  %14s %10.2f %9.1f %8.1f GB/s  %s",
+            sq ? fmt("%llu MiB seq", (unsigned long long)(sq / kMiB)).c_str() : "nothing", m, m * 1e3 / line0, avg,
+            ok ? "= CPU reference" : "WRONG");
+    }
+    verdict(okB ? "PASS" : "FAIL", "sliced random read: every run's checksum equals the CPU reference");
+    const double gainB = bestB / std::max(1e-9, randB0);
+    if (bestBSeq)
+        rows_.push_back({fmt("READ rand +%lluM seq", (unsigned long long)(bestBSeq / kMiB)), bestBRuns, okB});
+
+    // C) footprint sweep without / with background load.
+    const unsigned cT = bestA->bgT ? bestA->bgT : std::min(2u, nt);
+    log("");
+    log("[C] GPU random read vs footprint, GB/s (M accesses/s): idle / %u CPU threads streaming / idle", cT);
+    log("  %10s %16s %16s %16s", "footprint", "idle", "+CPU load", "idle again");
+    struct FpRow {
+        uint64_t fp;
+        double idle, load;
+    };
+    std::vector<FpRow> fr;
+    std::vector<uint64_t> fps;
+    for (uint64_t fp = 16 * kMiB; fp <= chunkBytes_; fp *= 2) fps.push_back(fp);
+    if (setBytes > chunkBytes_) fps.push_back(setBytes);
+    for (uint64_t fp : fps) {
+        Job j = rnd;
+        if (fp <= chunkBytes_) {
+            j.numChunks = 1;
+            j.linesBits = log2u(fp / line0);
+            j.passes = uint32_t(std::max<uint64_t>(1, (256 * kMiB) / fp));
+            while (vecsPerChunk(j) > 0xFFFFFFFFull) j.passes /= 2;
+        }
+        const double bytes = jobBytes(j);
+        double v[3];
+        for (int k = 0; k < 3; ++k) v[k] = point(k == 1 ? cT : 0, j, bytes, false).rnd.med;
+        auto cell = [&](double x) { return fmt("%6.2f (%5.0f)", x, x * 1e3 / line0); };
+        log("  %6llu MiB %16s %16s %16s", (unsigned long long)(fp / kMiB), cell(v[0]).c_str(), cell(v[1]).c_str(),
+            cell(v[2]).c_str());
+        fr.push_back({fp, 0.5 * (v[0] + v[2]), v[1]});
+    }
+
+    // Verdict.
+    log("");
+    log("==================================== RAND vs DVFS ====================================");
+    log("  READ seq %.2f GB/s, READ rand %.2f GB/s idle -> rand/seq %.1f%%", idleA.seq.med, idleA.rnd.med,
+        100.0 * idleA.rnd.med / idleA.seq.med);
+    log("  CPU background load (%u thr) : rand %.2f GB/s = x%.2f vs idle", bestA->bgT, bestA->rnd.med, gainA);
+    log("  GPU seq between slices      : rand %.2f GB/s = x%.2f vs slices alone (%.2f)", bestB, gainB, randB0);
+    size_t cliff = 0;  // biggest drop between neighbouring footprints (idle)
+    double drop = 1, dropLoad = 1;
+    for (size_t i = 1; i < fr.size(); ++i) {
+        double d = fr[i - 1].idle / std::max(1e-9, fr[i].idle);
+        if (d > drop) {
+            drop = d;
+            dropLoad = fr[i - 1].load / std::max(1e-9, fr[i].load);
+            cliff = i;
+        }
+    }
+    if (cliff)
+        log("  footprint cliff %llu -> %llu MiB: x%.1f slower idle, x%.1f slower with CPU load",
+            (unsigned long long)(fr[cliff - 1].fp / kMiB), (unsigned long long)(fr[cliff].fp / kMiB), drop, dropLoad);
+    log("  diagnosis:");
+    const double g = std::max(gainA, gainB);
+    if (g >= 1.3)
+        log("    - random read rises x%.1f when the memory clocks are kept up: the clock governors (DDR / bus"
+            " vote from the measured bandwidth) are a large part of the low random number", g);
+    else
+        log("    - background traffic does not help (x%.2f): the clock governors are not what limits it", g);
+    if (cliff && drop >= 3 && dropLoad >= 3)
+        log("    - the footprint cliff stays with the clocks up: GPU address translation (TLB reach between %llu"
+            " and %llu MiB) limits random reads over large footprints",
+            (unsigned long long)(fr[cliff - 1].fp / kMiB), (unsigned long long)(fr[cliff].fp / kMiB));
+    else if (cliff && drop >= 3)
+        log("    - the footprint cliff shrinks with the clocks up (x%.1f -> x%.1f): it is mostly clock related",
+            drop, dropLoad);
+    log("  RAND vs DVFS time: %.0f s",
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
+}
+
 int Bench::summary() {
     log("");
     log("==================================== SUMMARY ====================================");
@@ -2056,9 +2385,9 @@ int Bench::run() {
     initVulkan();
     createResources();
     log("Seed           : %u  (reproduce with --seed %u)", seed_, seed_);
-    if (!o_.peak && !o_.cpu) log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
+    if (!o_.peak && !o_.cpu && !o_.dvfs) log("Warm-up        : %.0f ms pre-warm, then per test >= %d runs and >= %.0f ms GPU time", o_.prewarmMs,
         o_.warmup, o_.warmupMs);
-    if (!o_.peak && !o_.cpu && o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
+    if (!o_.peak && !o_.cpu && !o_.dvfs && o_.boostMs > 0 && (o_.boostCpu || o_.boostGpu))
         log("Boost          : %.0f ms %s load before the tests", o_.boostMs,
             o_.boostCpu && o_.boostGpu ? "CPU + GPU GEMM" : o_.boostCpu ? "CPU" : "GPU GEMM");
     if (o_.injectFault)
@@ -2069,8 +2398,9 @@ int Bench::run() {
     log("[INIT] filling the working set with seed-dependent pseudo-random data");
     fill(ref::hash32(seed_));
     verdict(verifyContent(curSeedMix_, "init") ? "PASS" : "FAIL", "initial memory content verified on the GPU");
-    if (o_.peak || o_.cpu) {
-        if (o_.peak) peak();
+    if (o_.peak || o_.cpu || o_.dvfs) {
+        if (o_.dvfs) dvfs();
+        else if (o_.peak) peak();
         else cpuRand();
         return summary();
     }
@@ -2122,6 +2452,9 @@ std::string usage() {
            "                   workgroup size, invocations and access size, then --cpu (~2.5 min)\n"
            "  --cpu            CPU random read peak: same data, addresses and checksum as the\n"
            "                   GPU; threads x prefetch, access size, footprint, latency\n"
+           "  --dvfs           random read vs memory clock governors: with CPU background\n"
+           "                   traffic, with GPU sequential reads between random slices, and\n"
+           "                   the footprint sweep idle / loaded (~1 min)\n"
            "  --no-checks      skip the anti-optimisation checks\n"
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
@@ -2167,6 +2500,7 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--sweep") o.sweep = true;
         else if (k == "--peak") o.peak = true;
         else if (k == "--cpu") o.cpu = true;
+        else if (k == "--dvfs") o.dvfs = true;
         else if (k == "--no-checks") o.checks = false;
         else if (k == "--no-cpu-ref") o.cpuRef = false;
         else if (k == "--inject-fault") o.injectFault = true;

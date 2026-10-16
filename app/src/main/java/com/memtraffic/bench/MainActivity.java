@@ -20,7 +20,7 @@ import android.widget.Toast;
  * (see `membench --help`). Output is also written to logcat with tag "membench".
  * Launch with arguments from adb:
  *   adb shell am start -n com.memtraffic.bench/.MainActivity --es args "--size-mb 1024 --sweep"
- * Without adb (e.g. devices managed by an MDM), "Peak finder" / "CPU random" run --peak / --cpu and
+ * Without adb (e.g. devices managed by an MDM), "Peak finder" / "CPU random" / "Rand vs DVFS" run --peak / --cpu / --dvfs;
  * "Share log" / "Copy log" hand the complete output to any app.
  */
 public class MainActivity extends Activity {
@@ -30,7 +30,7 @@ public class MainActivity extends Activity {
 
     private TextView out;
     private ScrollView scroll;
-    private Button run, peak, cpu, share, copy;
+    private Button run, peak, cpu, dvfs, share, copy;
     private EditText args;
     private final StringBuilder logText = new StringBuilder();
 
@@ -56,6 +56,7 @@ public class MainActivity extends Activity {
         cpu = button(row1, "CPU random", v -> start(args.getText().toString() + " --cpu"));
         root.addView(row1);
         LinearLayout row2 = new LinearLayout(this);
+        dvfs = button(row2, "Rand vs DVFS", v -> start(args.getText().toString() + " --dvfs"));
         share = button(row2, "Share log", v -> shareLog());
         copy = button(row2, "Copy log", v -> copyLog());
         root.addView(row2);
@@ -86,6 +87,7 @@ public class MainActivity extends Activity {
         run.setEnabled(false);
         peak.setEnabled(false);
         cpu.setEnabled(false);
+        dvfs.setEnabled(false);
         out.setText("");
         logText.setLength(0);
         logText.append("device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
@@ -99,6 +101,7 @@ public class MainActivity extends Activity {
                 run.setEnabled(true);
                 peak.setEnabled(true);
                 cpu.setEnabled(true);
+                dvfs.setEnabled(true);
             });
         }, "membench").start();
     }

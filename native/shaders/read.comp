@@ -6,6 +6,10 @@
 // SINK = 0 builds the *dead-code control*: identical loop, but the result is never
 // stored. A compiler is free to delete the loads, so this variant shows how fast
 // "optimised away" work looks on this driver (it should be ~free).
+//
+// pc.dstVecOffset (unused by reads otherwise) shifts the logical indices, so one job can
+// be split into slices [offset, offset + itersPerThread * numThreads) that together
+// produce the checksum of the whole job.
 
 layout(constant_id = 1) const uint SINK = 1u;
 
@@ -14,7 +18,7 @@ layout(constant_id = 1) const uint SINK = 1u;
 layout(std430, set = 0, binding = 0) readonly buffer Data { uvec4 data[]; };
 
 void main() {
-    uint tid = gl_GlobalInvocationID.x;
+    uint tid = gl_GlobalInvocationID.x + pc.dstVecOffset;
     uint T   = pc.numThreads;
     uvec2 acc = uvec2(0u);
 

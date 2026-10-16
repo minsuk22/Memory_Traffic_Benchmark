@@ -3,8 +3,12 @@
 // formula and the GPU result for the same job: every line was really loaded.
 #pragma once
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace mb {
@@ -54,6 +58,49 @@ ReadResult randRead(const Buffer& b, const ReadCfg& c);
 void expectedChecksum(const ReadCfg& c, uint32_t out[2]);
 // Transparent-huge-page mode and AnonHugePages of this process (best effort).
 std::string hugePageInfo();
+
+// Background sequential reads on `threads` cores over a buffer (>> caches), so the memory
+// clock governors see high DRAM bandwidth while something else is measured.
+class StreamLoad {
+public:
+    StreamLoad() = default;
+    StreamLoad(const StreamLoad&) = delete;
+    StreamLoad& operator=(const StreamLoad&) = delete;
+    ~StreamLoad() { stop(); }
+    void start(const uint32_t* words, uint64_t bytes, unsigned threads);
+    void stop();
+    void mark();                 // starts a measurement window
+    double gbpsSinceMark() const;
+
+private:
+    std::vector<std::thread> th_;
+    std::atomic<bool> stop_{false};
+    std::atomic<uint64_t> bytes_{0};
+    uint64_t markBytes_ = 0;
+    std::chrono::steady_clock::time_point markT_;
+};
+
+// Clock files (devfreq cur_freq, kgsl gpuclk) the app is allowed to read. Usually none on
+// production phones (SELinux), in which case the sampler reports nothing.
+struct ClockFile {
+    std::string name, path;
+};
+std::vector<ClockFile> findClockFiles();
+
+// Samples the clock files every 20 ms between start() and stop().
+class ClockSampler {
+public:
+    explicit ClockSampler(const std::vector<ClockFile>& f) : files_(f) {}
+    ~ClockSampler() { stop(); }
+    void start();
+    std::string stop();  // "name min-max MHz, ..." ("" without readable files)
+
+private:
+    std::vector<ClockFile> files_;
+    std::vector<std::pair<double, double>> range_;
+    std::thread th_;
+    std::atomic<bool> stop_{false};
+};
 
 }  // namespace cpu
 }  // namespace mb
