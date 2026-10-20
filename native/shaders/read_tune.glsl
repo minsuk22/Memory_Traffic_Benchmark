@@ -13,9 +13,25 @@
 
 layout(constant_id = 1) const uint UNROLL = 4u;
 layout(constant_id = 2) const uint VPL = 1u;
+// ROLL = 1: rolling windows. One dispatch covers many consecutive windows; workgroup g
+// works on window g / pc.keyB.x (keyB.x = workgroups per window), so with the GPU starting
+// workgroups roughly in ID order only a few windows are active at any time, without a
+// barrier between windows. keyA.x = permutation key base (keys derived per window here,
+// exactly like deriveKey() on the host), keyB.y = global index of the first window,
+// keyB.z = uvec4 per window; pc.numThreads = invocations per window.
+layout(constant_id = 3) const uint ROLL = 0u;
+// SPREAD_SHIFT = s > 0: only one line per 2^s line slots is read (line i at slot i << s), so
+// no two lines read share a 2^s-line block. Checks whether small windows are fast only
+// because the other half of a larger cache line is hit later (that would not be random).
+layout(constant_id = 4) const uint SPREAD_SHIFT = 0u;
 const uint NL = UNROLL * VPL;
 
 #include "common.glsl"
+
+uint spreadIndex(uint vi) {
+    if (SPREAD_SHIFT == 0u) return vi;
+    return ((vi >> pc.vplShift) << (pc.vplShift + SPREAD_SHIFT)) | (vi & ((1u << pc.vplShift) - 1u));
+}
 
 #ifdef TEXEL
 layout(set = 0, binding = 2) uniform usamplerBuffer tex;
@@ -32,14 +48,29 @@ layout(std430, set = 0, binding = 0) readonly buffer Data { uvec4 data[]; };
     uint g##k = 0u;                                                            \
     if (k < NL) {                                                              \
         g##k = ((it + k / VPL) * T + tid) * VPL + k % VPL;                     \
-        v##k = LOAD(base + vecIndex(g##k, pc.keyA));                           \
+        v##k = LOAD(base + spreadIndex(vecIndex(g##k, key)));                  \
     }
-#define MIX(k) if (k < NL) acc = mixChecksum(acc, v##k, pc.logicalBase + g##k);
+#define MIX(k) if (k < NL) acc = mixChecksum(acc, v##k, lbase + g##k);
+
+// Host deriveKey(base, w): per-window permutation key.
+uvec4 windowKey(uint b, uint w) {
+    return uvec4(hash32(b + 0x9E3779B9u * (w * 4u + 1u)), hash32(b + 0x9E3779B9u * (w * 4u + 2u)),
+                 hash32(b + 0x9E3779B9u * (w * 4u + 3u)), hash32(b + 0x9E3779B9u * (w * 4u + 4u)));
+}
 
 void main() {
-    uint tid  = gl_GlobalInvocationID.x;
-    uint T    = pc.numThreads;
-    uint base = pc.dstVecOffset;
+    uint tid   = gl_GlobalInvocationID.x;
+    uint T     = pc.numThreads;
+    uint base  = pc.dstVecOffset;
+    uint lbase = pc.logicalBase;
+    uvec4 key  = pc.keyA;
+    if (ROLL != 0u) {
+        uint wl = gl_WorkGroupID.x / pc.keyB.x;  // window inside this dispatch
+        tid   = (gl_WorkGroupID.x % pc.keyB.x) * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+        base  = pc.dstVecOffset + wl * pc.keyB.w;  // keyB.w = uvec4 of memory per window
+        lbase = pc.logicalBase + wl * pc.keyB.z;
+        key   = windowKey(pc.keyA.x, pc.keyB.y + wl);
+    }
     uvec2 acc = uvec2(0u);
 
     for (uint it = 0u; it < pc.itersPerThread; it += UNROLL) {

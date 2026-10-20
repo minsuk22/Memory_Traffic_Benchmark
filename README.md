@@ -188,19 +188,49 @@ bytes should equal the reported traffic (for 64 B lines).
   while the whole set is still read once per pass. Choose N below the footprint where the
   `--dvfs` sweep falls off (Adreno 830: 64 MiB). This is the random-read bandwidth without GPU
   address-translation misses; the normal run (256 MiB chunks) includes them.
-* Random read tuning (`--rand-tune`, app button **Rand tuning**, ~1 min): inside a 64 MiB
-  window (or `--window-mb N`), what else limits the random read? A greedy search varies one
-  factor at a time and keeps the best value (> 3 % better, candidates measured round-robin):
-  invocations per dispatch (GPU-wide memory-level parallelism), workgroup size, random lines
-  in flight per invocation (`UNROLL` 1..16), bytes one lane loads per line (16 / 32 / 64 B),
-  load path (storage buffer vs uniform texel buffer = texture pipe), subgroup size
-  (`VK_EXT_subgroup_size_control`), window size, the memory allocation (set re-allocated with
-  every device-local memory type, default type twice), and — for information only — the access size
-  32..256 B. Kernel: `shaders/read_tune.glsl` (same addresses, data and checksum as
-  `read.comp`); every timed run is checked against the CPU reference. If no shape helps but
-  larger lines do, the limit is the per-access cost of DRAM (row activations), not the GPU.
+* Random read tuning (`--rand-tune`, app button **Rand tuning**, ~1 min): a greedy search
+  that varies one factor at a time and keeps the best value (> 3 % better, candidates measured
+  round-robin), in this order:
+  1. window size 1 MiB .. chunk (first: above the GPU TLB reach every other knob is hidden);
+  2. **rolling windows**: one dispatch per chunk, workgroup `g` works on window `g / G`, so with
+     workgroups started roughly in ID order only a few windows are active at a time — a small
+     footprint without a barrier and pipeline drain after every window;
+  3. invocations, workgroup size, random lines in flight per invocation (`UNROLL` 1..16),
+     bytes per lane (16 / 32 / 64 B), storage vs uniform texel buffer, subgroup size;
+  4. window again, memory allocation (every device-local type, default type twice, one
+     allocation for the whole set), and — information only — the access size 32..256 B.
+
+  **Cache-line reuse guard:** a small window could look fast only because the memory system
+  fetches 128 B and the other 64 B are hit in a cache later. The tuner therefore also reads
+  only one 64 B line per 128 B block (same lines in flight per invocation); if that is > 10 %
+  slower, windows below 4 MiB are not used (WARN). Every line of the set is read exactly once
+  per run, every timed run is checked against the CPU reference. Kernel: `shaders/read_tune.glsl`.
 
 ## 6. Results
+
+### Galaxy S22 Ultra (SM-S908N, Snapdragon 8 Gen 1 / Adreno 730, LPDDR5-6400 x64 = 51.2 GB/s peak)
+
+`--size-mb 1024 --rand-tune` (v1.11, `results/SM-S908N_rand_tune.txt`) — all runs verified
+
+| random 64 B read | GB/s | % of READ seq (47.5) |
+|---|---|---|
+| 64 MiB windows, one at a time (v1.8 shape) | 6.2 | 13 % (GPU TLB misses: reach 32..64 MiB) |
+| 4 MiB windows, one at a time | 29 | 63 % |
+| 4 MiB rolling windows | 30 | 65 % |
+| **1 MiB rolling windows** | **36.4 – 36.6** | **75 – 77 %** |
+| 1 MiB rolling, one line per 128 B (reuse guard) | 34–35 | 0.93 – 1.05 of dense → no cache-line reuse |
+
+No kernel shape knob (invocations, workgroup, unroll, bytes per lane, texel path, subgroup
+size, memory type) moves the number by more than noise once the window is right; random
+128 B lines reach ~100 % of sequential. The random-read limit on this GPU is the number of
+pages touched at a time (address translation), not DRAM.
+
+**Driver issue found on this phone:** inside the app (not in the adb CLI), two back-to-back
+independent dispatches in one command buffer sometimes came out completely wrong — always
+two consecutive 128 MiB chunks, in every 1 GiB run, also with v1.8 and with one allocation for
+the whole set. The initial content check caught it (`[FAIL] initial memory content`). Since
+v1.11 every chunk dispatch is separated by a compute→compute barrier (a few µs per run),
+which fixes it; a failed content check now also lists the wrong chunks and fills once more.
 
 ### Galaxy S24+ (SM-S926N, Exynos 2400 / Xclipse 940, LPDDR5X-8533 x64 = 68.3 GB/s peak)
 

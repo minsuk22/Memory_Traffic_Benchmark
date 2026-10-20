@@ -123,6 +123,7 @@ struct Job {
     uint32_t dstVecOffset = 0;
     uint32_t mode       = 0;
     uint32_t numChunks  = 1;
+    uint32_t firstChunk = 0;  // chunks [firstChunk, firstChunk + numChunks)
     uint32_t unroll     = 4;  // iterations per thread must be a multiple of this
 };
 
@@ -244,6 +245,7 @@ private:
     uint64_t threadCap_ = 0;
     int dataType_ = -1;
     int forceMemType_ = -1;  // --rand-tune memory section: allocate chunks from this type
+    bool oneAlloc_ = false;  // --rand-tune memory section: one allocation for all chunks
 
     VkBuffer outBuf_ = VK_NULL_HANDLE;
     VkDeviceMemory outMem_ = VK_NULL_HANDLE;
@@ -618,7 +620,9 @@ void Bench::createResources() {
     outMap_ = static_cast<volatile uint32_t*>(p);
 
     // --- data chunks -------------------------------------------------------------------
+    oneAlloc_ = o_.oneAlloc;
     size_t got = allocChunks(nChunks);
+    oneAlloc_ = false;
     if (got < nChunks)
         log("WARNING: allocation of chunk %zu failed; continuing with %zu chunk(s)", got, got);
 
@@ -663,33 +667,17 @@ size_t Bench::allocChunks(size_t n) {
     bci.size = chunkBytes_;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (o_.randTune) bci.usage |= VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;  // texture-path loads
-    size_t got = 0;
-    for (; got < n; ++got) {
-        Chunk ch;
-        VK_CHECK(vkCreateBuffer(dev_, &bci, nullptr, &ch.buf));
-        VkMemoryRequirements mr;
-        vkGetBufferMemoryRequirements(dev_, ch.buf, &mr);
-        const VkMemoryPropertyFlags never =
-            VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT;
+    const VkMemoryPropertyFlags never = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT;
+    auto typeFor = [&](uint32_t bits) {
         // Prefer plain device-local memory (no CPU-cached/snooped types).
-        int t = pickMemType(memProps_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                            never | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-        if (t < 0) t = pickMemType(memProps_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, never);
-        if (t < 0) t = pickMemType(memProps_, mr.memoryTypeBits, 0, never);
-        if (forceMemType_ >= 0 && (mr.memoryTypeBits & (1u << forceMemType_))) t = forceMemType_;
+        int t = pickMemType(memProps_, bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, never | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (t < 0) t = pickMemType(memProps_, bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, never);
+        if (t < 0) t = pickMemType(memProps_, bits, 0, never);
+        if (forceMemType_ >= 0 && (bits & (1u << forceMemType_))) t = forceMemType_;
         if (t < 0) throw std::runtime_error("no usable memory type");
-        dataType_ = t;
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = mr.size;
-        mai.memoryTypeIndex = (uint32_t)t;
-        VkResult r = vkAllocateMemory(dev_, &mai, nullptr, &ch.mem);
-        if (r != VK_SUCCESS) {
-            vkDestroyBuffer(dev_, ch.buf, nullptr);
-            if (chunks_.empty()) VK_CHECK(r);
-            break;
-        }
-        VK_CHECK(vkBindBufferMemory(dev_, ch.buf, ch.mem, 0));
-
+        return t;
+    };
+    auto setFor = [&](Chunk& ch) {
         VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         dai.descriptorPool = pool_;
         dai.descriptorSetCount = 1;
@@ -706,6 +694,54 @@ size_t Bench::allocChunks(size_t n) {
             w[i].pBufferInfo = &bi[i];
         }
         vkUpdateDescriptorSets(dev_, 2, w, 0, nullptr);
+    };
+
+    // --rand-tune memory section: one allocation for the whole set, the chunk buffers bound
+    // at offsets (the driver may back a large allocation with larger pages). Chunk 0 owns it.
+    if (oneAlloc_ && chunks_.empty() && n > 1) {
+        std::vector<Chunk> cs(n);
+        for (auto& ch : cs) VK_CHECK(vkCreateBuffer(dev_, &bci, nullptr, &ch.buf));
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(dev_, cs[0].buf, &mr);
+        const uint64_t stride = (mr.size + mr.alignment - 1) / mr.alignment * mr.alignment;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = stride * n;
+        mai.memoryTypeIndex = (uint32_t)typeFor(mr.memoryTypeBits);
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        if (mai.allocationSize <= maxAlloc_ && vkAllocateMemory(dev_, &mai, nullptr, &mem) == VK_SUCCESS) {
+            dataType_ = int(mai.memoryTypeIndex);
+            for (size_t i = 0; i < n; ++i) {
+                VK_CHECK(vkBindBufferMemory(dev_, cs[i].buf, mem, stride * i));
+                cs[i].mem = i ? VK_NULL_HANDLE : mem;
+                setFor(cs[i]);
+                chunks_.push_back(cs[i]);
+            }
+            return n;
+        }
+        for (auto& ch : cs) vkDestroyBuffer(dev_, ch.buf, nullptr);
+        log("  (one %llu MiB allocation not possible, separate chunks used)",
+            (unsigned long long)(mai.allocationSize / kMiB));
+    }
+
+    size_t got = 0;
+    for (; got < n; ++got) {
+        Chunk ch;
+        VK_CHECK(vkCreateBuffer(dev_, &bci, nullptr, &ch.buf));
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(dev_, ch.buf, &mr);
+        const int t = typeFor(mr.memoryTypeBits);
+        dataType_ = t;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = (uint32_t)t;
+        VkResult r = vkAllocateMemory(dev_, &mai, nullptr, &ch.mem);
+        if (r != VK_SUCCESS) {
+            vkDestroyBuffer(dev_, ch.buf, nullptr);
+            if (chunks_.empty()) VK_CHECK(r);
+            break;
+        }
+        VK_CHECK(vkBindBufferMemory(dev_, ch.buf, ch.mem, 0));
+        setFor(ch);
         chunks_.push_back(ch);
     }
     return got;
@@ -837,9 +873,13 @@ JobResult Bench::execute(const Job& j) {
 
     JobResult r = submitTimed([&] {
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, j.pipe);
-        for (uint32_t c = 0; c < j.numChunks; ++c) {
-            // --window-mb: one window at a time, so the random footprint never exceeds it
-            if (o_.windowMB && c) computeBarrier();
+        for (uint32_t c = j.firstChunk; c < j.firstChunk + j.numChunks; ++c) {
+            // One chunk after the other: keeps the --window-mb footprint to one window, and
+            // works around Adreno 730 (S22 Ultra, driver 0x80267062) mixing up the state of
+            // back-to-back independent dispatches inside an app process: without it, two
+            // consecutive chunks came out completely wrong in every 1 GiB app run (the CLI
+            // was never affected).
+            if (c > j.firstChunk) computeBarrier();
             Push pc{};
             pc.chunkWordBase = uint32_t(c * (chunkBytes_ / 4));
             pc.logicalBase = uint32_t(c * vecs);
@@ -1368,8 +1408,20 @@ bool Bench::verifyContent(uint32_t seedMix, const char* what) {
     v.unroll = 1;
     JobResult r = execute(v);
     bool ok = r.chkX == 0 && r.wgDone == r.wgExpected;
-    if (!ok)
+    if (!ok) {
         log("  verify %s: %u mismatching 16-byte words, %u/%u workgroups", what, r.chkX, r.wgDone, r.wgExpected);
+        // Which chunks? (whole chunks wrong = a lost dispatch or a chunk whose memory changed)
+        std::string bad;
+        for (uint32_t c = 0; c < chunks_.size(); ++c) {
+            Job one = v;
+            one.firstChunk = c;
+            one.numChunks = 1;
+            JobResult rc = execute(one);
+            if (rc.chkX || rc.wgDone != rc.wgExpected)
+                bad += fmt(" %u(%u%s)", c, rc.chkX, rc.wgDone != rc.wgExpected ? ", workgroups lost" : "");
+        }
+        log("  verify %s: wrong chunks (mismatching words):%s", what, bad.empty() ? " none on re-check" : bad.c_str());
+    }
     return ok;
 }
 
@@ -2613,7 +2665,7 @@ void Bench::randTune() {
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::vector<VkDescriptorSet> sets;
         std::vector<VkBufferView> views;
-        std::map<std::array<uint32_t, 5>, VkPipeline> pipes;
+        std::map<std::array<uint32_t, 7>, VkPipeline> pipes;
         ~Res() {
             vkDeviceWaitIdle(d);
             for (auto& p : pipes)
@@ -2702,11 +2754,13 @@ void Bench::randTune() {
         uint32_t threads, wg, unroll, vpl, line, sg;  // sg 0 = driver's choice
         uint64_t window;
         bool texel;
-        auto tie() const { return std::make_tuple(threads, wg, unroll, vpl, line, sg, window, texel); }
+        bool roll = false;     // rolling windows (one dispatch per chunk) instead of one window per dispatch
+        uint32_t spread = 0;   // read one line per 2^spread line slots (cache-line reuse check)
+        auto tie() const { return std::make_tuple(threads, wg, unroll, vpl, line, sg, window, texel, roll, spread); }
     };
 
     auto pipeFor = [&](const Cfg& c) -> VkPipeline {
-        const std::array<uint32_t, 5> k = {c.wg, c.unroll, c.vpl, c.texel ? 1u : 0u, c.sg};
+        const std::array<uint32_t, 7> k = {c.wg, c.unroll, c.vpl, c.texel ? 1u : 0u, c.sg, c.roll ? 1u : 0u, c.spread};
         auto it = res.pipes.find(k);
         if (it != res.pipes.end()) return it->second;
         VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -2714,9 +2768,9 @@ void Bench::randTune() {
         smci.pCode = c.texel ? kReadTuneTexelSpv : kReadTuneSsboSpv;
         VkShaderModule sm;
         VK_CHECK(vkCreateShaderModule(dev_, &smci, nullptr, &sm));
-        uint32_t spec[3] = {c.wg, c.unroll, c.vpl};
-        VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
-        VkSpecializationInfo si{3, me, sizeof spec, spec};
+        uint32_t spec[5] = {c.wg, c.unroll, c.vpl, c.roll ? 1u : 0u, c.spread};
+        VkSpecializationMapEntry me[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}};
+        VkSpecializationInfo si{5, me, sizeof spec, spec};
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rs{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
         rs.requiredSubgroupSize = c.sg;
@@ -2744,24 +2798,31 @@ void Bench::randTune() {
     // Invocations actually used: at most one per UNROLL * VPL uvec4 of a window and within
     // the workgroup count limit.
     auto shape = [&](const Cfg& c, uint32_t& T, uint32_t& iters) {
-        const uint64_t vecs = c.window / 16;
+        const uint64_t vecs = (c.window / 16) >> c.spread;  // uvec4 read per window
         uint64_t t = std::min<uint64_t>({c.threads, vecs / (uint64_t(c.unroll) * c.vpl), c.wg * maxGroups});
         t = std::max<uint64_t>(t, c.wg);
         T = uint32_t(t);
         iters = uint32_t(vecs / (t * c.vpl));
     };
 
-    // One run over the whole set: one dispatch per window, a barrier between windows.
+    // One run over the whole set. Default: one dispatch per window, a barrier between
+    // windows. Rolling: one dispatch for all windows of a chunk (fewer if the workgroup
+    // count limit is reached), a barrier only between those dispatches.
     auto runOnce = [&](const Cfg& c, VkPipeline p, uint32_t pattern) {
         uint32_t T, iters;
         shape(c, T, iters);
-        const uint64_t vecs = c.window / 16, perChunk = chunkBytes_ / c.window, nWin = chunks_.size() * perChunk;
-        const uint32_t lb = log2u(c.window / c.line);
+        const uint64_t vecs = (c.window / 16) >> c.spread, perChunk = chunkBytes_ / c.window,
+                       nWin = chunks_.size() * perChunk;
+        const uint32_t lb = log2u(c.window / c.line) - c.spread;
+        const uint32_t G = T / c.wg;  // workgroups per window
+        const uint64_t step = c.roll ? std::max<uint64_t>(1, std::min<uint64_t>(perChunk, maxGroups / G)) : 1;
+        uint64_t groups = 0;
         JobResult r = submitTimed([&] {
             vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, p);
-            for (uint64_t w = 0; w < nWin; ++w) {
-                if (w) computeBarrier();
+            for (uint64_t w = 0; w < nWin;) {
                 const uint64_t ch = w / perChunk, off = (w % perChunk) * c.window;
+                const uint64_t nw = std::min(step, perChunk - w % perChunk);
+                if (w) computeBarrier();  // between all dispatches (driver workaround, see execute())
                 Push pc{};
                 pc.chunkWordBase = uint32_t(ch * (chunkBytes_ / 4) + off / 4);
                 pc.logicalBase = uint32_t(w * vecs);
@@ -2772,30 +2833,39 @@ void Bench::randTune() {
                 pc.seedMix = curSeedMix_;
                 pc.outSlot = 0;
                 deriveKey(rkey, uint32_t(w), pc.keyA);
+                if (c.roll) {
+                    pc.keyA[0] = rkey;
+                    pc.keyB[0] = G;
+                    pc.keyB[1] = uint32_t(w);
+                    pc.keyB[2] = uint32_t(vecs);
+                    pc.keyB[3] = uint32_t(c.window / 16);
+                }
                 pc.itersPerThread = iters;
                 pc.numThreads = T;
                 pc.dstVecOffset = uint32_t(off / 16);
                 vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, res.pl, 0, 1, &res.sets[ch], 0, nullptr);
                 vkCmdPushConstants(cmd_, res.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
-                vkCmdDispatch(cmd_, T / c.wg, 1, 1);
+                vkCmdDispatch(cmd_, uint32_t(G * nw), 1, 1);
+                groups += G * nw;
+                w += nw;
             }
         });
-        r.wgExpected = uint32_t(nWin * (T / c.wg));
+        r.wgExpected = uint32_t(groups);
         return r;
     };
 
     // CPU reference: depends on the window, line size and pattern only (not on the shape).
-    std::map<std::array<uint64_t, 3>, std::array<uint32_t, 2>> refs;
+    std::map<std::array<uint64_t, 4>, std::array<uint32_t, 2>> refs;
     auto refFor = [&](const Cfg& c, uint32_t pattern) {
-        const std::array<uint64_t, 3> k = {c.window, c.line, pattern};
+        const std::array<uint64_t, 4> k = {c.window, c.line, pattern, c.spread};
         auto it = refs.find(k);
         if (it != refs.end()) return it->second;
-        const uint64_t vecs = c.window / 16, perChunk = chunkBytes_ / c.window;
-        const uint32_t lb = log2u(c.window / c.line), vs = log2u(c.line / 16);
+        const uint64_t vecs = (c.window / 16) >> c.spread, perChunk = chunkBytes_ / c.window;
+        const uint32_t lb = log2u(c.window / c.line) - c.spread, vs = log2u(c.line / 16);
         std::array<uint32_t, 2> out;
         refChecksum(uint32_t(chunks_.size() * perChunk), vecs,
                     [&](uint32_t w, ref::Params& p, uint32_t& wordBase, uint32_t& logicalBase) {
-                        p = {(1u << lb) - 1u, lb, vs, pattern, curSeedMix_, {}};
+                        p = {(1u << lb) - 1u, lb, vs, pattern, curSeedMix_, {}, c.spread};
                         deriveKey(rkey, w, p.keyA);
                         wordBase = uint32_t((w / perChunk) * (chunkBytes_ / 4) + (w % perChunk) * c.window / 4);
                         logicalBase = uint32_t(w * vecs);
@@ -2824,7 +2894,7 @@ void Bench::randTune() {
         for (int i = 0; i <= reps; ++i) {  // run 0 is discarded (but checked)
             JobResult r = runOnce(c, p, pattern);
             pt.ok &= r.chkX == ref[0] && r.chkY == ref[1] && r.wgDone == r.wgExpected;
-            if (i) pt.runs.push_back(double(setBytes) / (r.ms() * 1e6));
+            if (i) pt.runs.push_back(double(setBytes >> c.spread) / (r.ms() * 1e6));
         }
         pt.ran = true;
         pt.med = median(pt.runs);
@@ -2836,9 +2906,11 @@ void Bench::randTune() {
     };
 
     auto cfgStr = [&](const Cfg& c, uint32_t T) {
-        return (T ? fmt("T %7u  ", T) : std::string()) + fmt("wg %4u  unroll %2u  %2u B/lane  %-5s  sg %-3s  win %3llu MiB  line %u B", c.wg, c.unroll,
+        return (T ? fmt("T %7u  ", T) : std::string()) +
+               fmt("wg %4u  unroll %2u  %2u B/lane  %-5s  sg %-3s  win %3llu MiB %-7s  line %u B", c.wg, c.unroll,
                    16 * c.vpl, c.texel ? "texel" : "ssbo", c.sg ? fmt("%u", c.sg).c_str() : "def",
-                   (unsigned long long)(c.window / kMiB), c.line);
+                   (unsigned long long)(c.window / kMiB), c.roll ? "rolling" : "barrier", c.line) +
+               (c.spread ? fmt(" (1 line per %u B)", c.line << c.spread) : std::string());
     };
 
     log("");
@@ -2921,7 +2993,85 @@ void Bench::randTune() {
         log("     keep: %s", cfgStr(best, 0).c_str());
     };
 
+    // The window comes first: above the GPU TLB reach (Adreno 730: 32..64 MiB, Adreno 830:
+    // 64..128 MiB) every other knob is hidden behind translation misses. Every line is read
+    // once per window, so a small window gives no cache reuse; it touches fewer pages (TLB)
+    // and fewer DRAM rows. Smallest window: 1 MiB (16384 lines of 64 B), raised to 4 MiB if
+    // the cache-line reuse guard below fails.
+    uint64_t minWindow = kMiB;
+    auto windowSection = [&](const char* title) {
+        std::vector<std::pair<std::string, Cfg>> v;
+        for (uint64_t w = minWindow; w <= chunkBytes_ && w <= setBytes && w <= 256 * kMiB; w *= 2) {
+            Cfg c = best;
+            c.window = w;
+            v.push_back({fmt("win %llu MiB", (unsigned long long)(w / kMiB)), c});
+        }
+        section(title, v, true);
+    };
+
+    // Guard for small windows: if the memory system fetched more than one line (128 B,
+    // 256 B) per access, the other lines of that block would be read later from a cache
+    // while the window is small, and the "random" read would really be a larger-block read.
+    // Reading only one line per 128 B block (same random lines in flight per invocation) would
+    // then be much slower. If it is (> 10%), windows below 4 MiB are not used from then on.
+    // 1 per 256 B is shown for information (a quarter of the lines per window: its
+    // invocations spread over more windows, i.e. more pages, so it is pessimistic). Measured
+    // round-robin (3 rounds) like the sections, so a clock dip cannot decide it.
+    bool reuseOk = true;
+    auto reuseCheck = [&](const char* when) {
+        std::vector<Cfg> v;
+        for (uint32_t s = 0; s <= 2; ++s) {
+            Cfg c = best;
+            c.spread = s;
+            v.push_back(c);
+        }
+        std::vector<Pt> pts(v.size());
+        log("  -- cache-line reuse check %s (window %llu MiB): one %u B line per %u / %u / %u B", when,
+            (unsigned long long)(best.window / kMiB), best.line, best.line, best.line * 2, best.line * 4);
+        for (int round = 0; round < 3; ++round)
+            for (size_t i = 0; i < v.size(); ++i) {
+                Pt p = point(v[i], kRand, 2);
+                Pt& a = pts[i];
+                a.ok = (round ? a.ok : true) && p.ok;
+                a.ran = p.ran;
+                a.T = p.T;
+                a.runs.insert(a.runs.end(), p.runs.begin(), p.runs.end());
+                a.med = median(a.runs);
+            }
+        for (size_t i = 0; i < v.size(); ++i) row(fmt("1 per %u B", best.line << v[i].spread), v[i], pts[i]);
+        const double ref0 = pts[0].med, half = pts[1].med;
+        const bool ok = ref0 > 0 && half >= 0.9 * ref0;
+        log("     1 per %u B / dense = %.2f (1 per %u B: %.2f): %s", best.line * 2, ref0 > 0 ? half / ref0 : 0.0,
+            best.line * 4, ref0 > 0 ? pts[2].med / ref0 : 0.0,
+            ok ? "no cache-line reuse, the window is a true 64 B random read"
+               : "small window profits from cache-line reuse");
+        reuseOk = ok;  // the last check (for the final shape) decides the verdict
+        if (!ok && best.window < 4 * kMiB) {
+            minWindow = std::min<uint64_t>(4 * kMiB, chunkBytes_);
+            best.window = minWindow;
+            log("     -> windows below %llu MiB are not used from here on", (unsigned long long)(minWindow / kMiB));
+        }
+    };
+
     log("");
+    const int base0Type = dataType_;
+    windowSection("window size (GPU TLB reach)");
+    {
+        // Small windows one at a time are limited by the dispatches themselves (few
+        // invocations per window, a pipeline drain at every barrier). Rolling windows keep
+        // the footprint small without barriers.
+        Cfg cur = best;
+        std::vector<std::pair<std::string, Cfg>> v = {{"one at a time", cur}};
+        for (uint64_t w = minWindow; w <= 32 * kMiB && w <= chunkBytes_; w *= 2) {
+            Cfg c = best;
+            c.window = w;
+            c.roll = true;
+            c.threads = std::max<uint32_t>(c.threads, 1u << 16);
+            v.push_back({fmt("roll %llu MiB", (unsigned long long)(w / kMiB)), c});
+        }
+        section("rolling windows (one dispatch per chunk, workgroups in ID order share a window)", v, true);
+    }
+    reuseCheck("after the window search");
     {
         std::vector<std::pair<std::string, Cfg>> v;
         uint32_t lastT = 0;
@@ -2988,19 +3138,7 @@ void Bench::randTune() {
     } else {
         log("  -- subgroup size: not selectable on this device (default %u lanes)", subgroupSize_);
     }
-    {
-        // Every line is read once per window, so a small window gives no cache reuse; it
-        // does concentrate the accesses on fewer DRAM rows (more row-buffer hits) and makes
-        // each dispatch shorter. Only windows >= 16 MiB are adopted.
-        std::vector<std::pair<std::string, Cfg>> small, v;
-        for (uint64_t w = 4 * kMiB; w <= chunkBytes_ && w <= setBytes; w *= 2) {
-            Cfg c = best;
-            c.window = w;
-            (w < 16 * kMiB ? small : v).push_back({fmt("win %llu MiB", (unsigned long long)(w / kMiB)), c});
-        }
-        if (!small.empty()) section("window size < 16 MiB (information: fewer DRAM rows)", small, false);
-        section("window size", v, true);
-    }
+    windowSection("window size again (with the tuned shape)");
     {
         // The physical pages behind the set (re-allocating gave +15..26% on Adreno 830) and
         // the memory type. The set is re-allocated, refilled with the same data (so the same
@@ -3010,17 +3148,20 @@ void Bench::randTune() {
         vkGetBufferMemoryRequirements(dev_, chunks_[0].buf, &mr);
         const int def = dataType_;
         const size_t n = chunks_.size();
-        std::vector<int> types = {def, def};  // default type twice: allocation-to-allocation spread
+        // (type, one allocation for the whole set): default type twice (allocation-to-
+        // allocation spread), default type as one allocation, every other device-local type.
+        std::vector<std::pair<int, bool>> types = {{def, false}, {def, false}, {def, true}};
         for (uint32_t i = 0; i < memProps_.memoryTypeCount; ++i) {
             const VkMemoryPropertyFlags f = memProps_.memoryTypes[i].propertyFlags;
             if ((int)i != def && (mr.memoryTypeBits & (1u << i)) && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
                 !(f & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT)))
-                types.push_back(int(i));
+                types.push_back({int(i), false});
         }
-        auto realloc = [&](int t) {
+        auto realloc = [&](int t, bool one) {
             releaseSets();
             freeChunks();
             forceMemType_ = t;
+            oneAlloc_ = one;
             size_t got = 0;
             try {
                 got = allocChunks(n);
@@ -3028,6 +3169,7 @@ void Bench::randTune() {
                 got = 0;
             }
             forceMemType_ = -1;
+            oneAlloc_ = false;
             const bool ok = got == n;
             if (!ok) {  // back to the default type
                 freeChunks();
@@ -3038,30 +3180,41 @@ void Bench::randTune() {
             return ok;
         };
         double defBest = 0, top = 0;
-        int topType = def;
+        std::pair<int, bool> topK = {def, false};
         for (size_t k = 0; k < types.size(); ++k) {
-            const int t = types[k];
-            if (!realloc(t)) {
+            const int t = types[k].first;
+            const bool one = types[k].second;
+            if (!realloc(t, one)) {
                 log("  mem type %d: allocation of %zu x %llu MiB failed", t, n, (unsigned long long)(chunkBytes_ / kMiB));
                 continue;
             }
+            const bool gotOne = n > 1 && chunks_.size() > 1 && chunks_[1].mem == VK_NULL_HANDLE;
             Pt pt = point(best, kRand, 5);
-            row(fmt("mem type %d", t), best, pt);
+            row(fmt(one ? "1 alloc t%d" : "mem type %d", t), best, pt);
             log("               [%s]%s", memFlagsStr(memProps_.memoryTypes[t].propertyFlags).c_str(),
-                k == 0 ? " default" : k == 1 ? " default, allocated again" : "");
+                k == 0   ? " default, separate chunk allocations"
+                : k == 1 ? " default, allocated again"
+                : one    ? (gotOne ? fmt(" one %llu MiB allocation, chunks bound at offsets",
+                                         (unsigned long long)(n * chunkBytes_ / kMiB)).c_str()
+                                   : " one allocation NOT possible (separate chunks)")
+                         : "");
             if (!pt.ok) continue;
-            if (t == def) defBest = std::max(defBest, pt.med);
+            if (t == def && !one) defBest = std::max(defBest, pt.med);
             if (pt.med > top) {
                 top = pt.med;
-                topType = t;
+                topK = {t, one && gotOne};
             }
         }
-        // The rest runs on a fresh allocation of the default type, or of another type that
+        // The rest runs on a fresh allocation of the default kind, or of another kind that
         // was > 3% faster.
-        const int use = topType != def && top > defBest * 1.03 ? topType : def;
-        realloc(use);
-        log("     keep: memory type %d [%s]", use, memFlagsStr(memProps_.memoryTypes[use].propertyFlags).c_str());
+        const auto use = topK != std::make_pair(def, false) && top > defBest * 1.03 ? topK : std::make_pair(def, false);
+        realloc(use.first, use.second);
+        log("     keep: memory type %d [%s]%s", use.first,
+            memFlagsStr(memProps_.memoryTypes[use.first].propertyFlags).c_str(),
+            use.second ? ", one allocation" : ", separate chunk allocations");
     }
+    if (dataType_ != base0Type || (chunks_.size() > 1 && chunks_[1].mem == VK_NULL_HANDLE))
+        windowSection("window size with the chosen allocation");
     {
         std::vector<std::pair<std::string, Cfg>> v;
         for (uint32_t ln = 32; ln <= 256; ln *= 2) {
@@ -3073,6 +3226,8 @@ void Bench::randTune() {
         }
         section("access size (information: GB/s at other line sizes, not adopted)", v, false);
     }
+
+    reuseCheck("for the final shape");
 
     // --- final: best shape with more runs, the v1.8 shape again (drift), sequential ---
     log("");
@@ -3106,8 +3261,20 @@ void Bench::randTune() {
         again.med > 0 ? fin.med / again.med : 0.0, cfgStr(best, fin.T).c_str());
     log("  target 70%% of seq (%.2f GB/s): %s", 0.7 * seqPeak,
         fin.med >= 0.7 * seqPeak ? "REACHED" : fmt("not reached, %.2f GB/s short", 0.7 * seqPeak - fin.med).c_str());
-    log("  reproduce the window with: --window-mb %llu --threads %u --wg %u",
-        (unsigned long long)(best.window / kMiB), fin.T, best.wg);
+    verdict(reuseOk ? "PASS" : "WARN",
+            reuseOk ? fmt("cache-line reuse check: reading 1 line per %u B is within 10%% of dense at the %llu MiB "
+                          "window - the small window is not a disguised larger-block read",
+                          best.line * 2, (unsigned long long)(best.window / kMiB))
+                    : fmt("cache-line reuse check: reading 1 line per %u B is > 10%% slower than dense at the %llu MiB "
+                          "window - part of the speed may come from cache-line reuse",
+                          best.line * 2, (unsigned long long)(best.window / kMiB)));
+    log("  every line of the %llu MiB set is read exactly once per run, in random order inside %llu MiB windows%s",
+        (unsigned long long)(setBytes / kMiB), (unsigned long long)(best.window / kMiB),
+        best.roll ? " (rolling: workgroups in ID order share a window, one dispatch per chunk)"
+                  : " (one window per dispatch)");
+    if (!best.roll)
+        log("  reproduce the window with: --window-mb %llu --threads %u --wg %u",
+            (unsigned long long)(best.window / kMiB), fin.T, best.wg);
     log("  RAND TUNE time: %.0f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
 }
 
@@ -3165,7 +3332,12 @@ int Bench::run() {
     log("");
     log("[INIT] filling the working set with seed-dependent pseudo-random data");
     fill(ref::hash32(seed_));
-    verdict(verifyContent(curSeedMix_, "init") ? "PASS" : "FAIL", "initial memory content verified on the GPU");
+    const bool initOk = verifyContent(curSeedMix_, "init");
+    if (!initOk) {  // diagnosis: does a second fill fix it, and are the same chunks affected?
+        fill(curSeedMix_);
+        verifyContent(curSeedMix_, "init after a 2nd fill");
+    }
+    verdict(initOk ? "PASS" : "FAIL", "initial memory content verified on the GPU");
     if (o_.peak || o_.cpu || o_.dvfs || o_.matrix || o_.randTune) {
         if (o_.randTune) randTune();
         else if (o_.matrix) matrix();
@@ -3281,6 +3453,7 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--dvfs") o.dvfs = true;
         else if (k == "--matrix") o.matrix = true;
         else if (k == "--rand-tune") o.randTune = true;
+        else if (k == "--one-alloc") o.oneAlloc = true;
         else if (k == "--no-checks") o.checks = false;
         else if (k == "--no-cpu-ref") o.cpuRef = false;
         else if (k == "--inject-fault") o.injectFault = true;

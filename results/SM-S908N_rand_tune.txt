@@ -1,0 +1,150 @@
+--------- beginning of main
+membench 1.11 - GPU-generated DRAM traffic benchmark (Vulkan compute)
+  device 0: Adreno (TM) 730  <- selected
+GPU            : Adreno (TM) 730 (vendor 0x5143, device 0x7030001)
+Vulkan API     : 1.1.128   driver version 0x80267062
+Limits         : maxStorageBufferRange 128 MiB, maxMemoryAllocationSize 1024 MiB, maxWGInvocations 1024
+Timestamps     : 48 valid bits, period 52.083 ns
+Matrix units   : not used (VK_KHR_cooperative_matrix not supported)
+Subgroups      : 64 lanes by default, 64..128 selectable (compute: yes, control feature: yes)
+Memory heap 0  :    11204 MiB DEVICE_LOCAL
+Memory heap 1  :      256 MiB DEVICE_LOCAL
+Data memory    : type 0 [DEVICE_LOCAL ]
+Working set    : 1024 MiB = 8 chunk(s) x 128 MiB  (requested 1024 MiB)
+Access         : 64 B per random address (4 lanes x 16 B), 2097152 lines per chunk
+Dispatch      : workgroup 256, up to 262144 invocations, 4 independent loads per iteration
+Seed           : 2968748549  (reproduce with --seed 2968748549)
+
+[INIT] filling the working set with seed-dependent pseudo-random data
+  fill (sequential write) :   40.554 ms    26.48 GB/s
+  -> [PASS] initial memory content verified on the GPU
+
+[RAND TUNE] random read inside a TLB-sized window: which kernel / dispatch shape is fastest?
+  every row: whole 1024 MiB set, one dispatch per window, every run checked against the CPU reference
+  T = invocations per dispatch, unroll = random lines in flight per invocation, B/lane = bytes one
+  invocation loads per line, texel = texture pipe instead of storage buffer, sg = subgroup size
+
+[PRE-WARM] 20 read runs, 21.5 GB in 2277 ms to raise GPU/DRAM clocks (separate key, not measured)
+
+  READ seq reference: read.comp 44.69 GB/s, tuning kernel 46.09 GB/s (1M invocations) -> 46.09 GB/s = 100%
+
+                  GB/s    M acc/s  % seq  configuration
+  v1.8 shape      5.37         84  11.7%  T  262144  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  64 MiB barrier  line 64 B
+
+  -- window size (GPU TLB reach)
+  win 1 MiB      32.14        502  69.7%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB barrier  line 64 B
+  win 2 MiB      31.85        498  69.1%  T   32768  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   2 MiB barrier  line 64 B
+  win 4 MiB      29.72        464  64.5%  T   65536  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   4 MiB barrier  line 64 B
+  win 8 MiB      28.06        438  60.9%  T  131072  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   8 MiB barrier  line 64 B
+  win 16 MiB     26.97        421  58.5%  T  262144  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  16 MiB barrier  line 64 B
+  win 32 MiB     25.97        406  56.4%  T  262144  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  32 MiB barrier  line 64 B
+  win 64 MiB      5.38         84  11.7%  T  262144  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  64 MiB barrier  line 64 B
+  win 128 MiB     2.90         45   6.3%  T  262144  wg  256  unroll  4  16 B/lane  ssbo   sg def  win 128 MiB barrier  line 64 B
+     keep: wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB barrier  line 64 B
+  -- rolling windows (one dispatch per chunk, workgroups in ID order share a window)
+  one at a time   31.93        499  69.3%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB barrier  line 64 B
+  roll 1 MiB     36.85        576  80.0%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  roll 2 MiB     33.86        529  73.5%  T   32768  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   2 MiB rolling  line 64 B
+  roll 4 MiB     30.52        477  66.2%  T   65536  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   4 MiB rolling  line 64 B
+  roll 8 MiB     28.67        448  62.2%  T  131072  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   8 MiB rolling  line 64 B
+  roll 16 MiB    27.42        429  59.5%  T  262144  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  16 MiB rolling  line 64 B
+  roll 32 MiB    24.36        381  52.9%  T  262144  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  32 MiB rolling  line 64 B
+     keep: wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  -- cache-line reuse check after the window search (window 1 MiB): one 64 B line per 64 / 128 / 256 B
+  1 per 64 B     27.46        429  59.6%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  1 per 128 B    25.57        400  55.5%  T    8192  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B (1 line per 128 B)
+  1 per 256 B    25.54        399  55.4%  T    4096  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B (1 line per 256 B)
+     1 per 128 B / dense = 0.93 (1 per 256 B: 0.93): no cache-line reuse, the window is a true 64 B random read
+  -- invocations (memory-level parallelism of the GPU)
+  T 16K          36.88        576  80.0%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+     keep: wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  -- workgroup size
+  wg 64          29.02        454  63.0%  T   16384  wg   64  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  wg 128         36.82        575  79.9%  T   16384  wg  128  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  wg 256         36.79        575  79.8%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  wg 512         36.36        568  78.9%  T   16384  wg  512  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  wg 1024         1.49         23   3.2%  T   16384  wg 1024  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+     keep: wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  -- random lines in flight per invocation
+  unroll 1       31.13        486  67.6%  T   65536  wg  256  unroll  1  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  unroll 2       36.79        575  79.8%  T   32768  wg  256  unroll  2  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  unroll 4       36.54        571  79.3%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  unroll 8       36.53        571  79.3%  T    8192  wg  256  unroll  8  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  unroll 16      33.82        528  73.4%  T    4096  wg  256  unroll 16  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+     keep: wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  -- bytes per lane (lanes per line = line / this)
+  16 B/lane      36.59        572  79.4%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  32 B/lane      36.14        565  78.4%  T    8192  wg  256  unroll  4  32 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  64 B/lane      33.79        528  73.3%  T    4096  wg  256  unroll  4  64 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+     keep: wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  -- load path
+  storage buf    36.64        573  79.5%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  texel buf      36.77        574  79.8%  T   16384  wg  256  unroll  4  16 B/lane  texel  sg def  win   1 MiB rolling  line 64 B
+     keep: wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  -- subgroup size (default 64)
+  sg default     36.57        571  79.3%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  sg 64          36.73        574  79.7%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg 64   win   1 MiB rolling  line 64 B
+  sg 128         36.71        574  79.7%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg 128  win   1 MiB rolling  line 64 B
+     keep: wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  -- window size again (with the tuned shape)
+  win 1 MiB      36.68        573  79.6%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  win 2 MiB      33.75        527  73.2%  T   32768  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   2 MiB rolling  line 64 B
+  win 4 MiB      30.55        477  66.3%  T   65536  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   4 MiB rolling  line 64 B
+  win 8 MiB      28.22        441  61.2%  T   65536  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   8 MiB rolling  line 64 B
+  win 16 MiB     27.01        422  58.6%  T   65536  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  16 MiB rolling  line 64 B
+  win 32 MiB     21.19        331  46.0%  T   65536  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  32 MiB rolling  line 64 B
+  win 64 MiB      5.22         82  11.3%  T   65536  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  64 MiB rolling  line 64 B
+  win 128 MiB     2.89         45   6.3%  T   65536  wg  256  unroll  4  16 B/lane  ssbo   sg def  win 128 MiB rolling  line 64 B
+     keep: wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  -- memory allocation (set re-allocated and refilled: same data, same checksums)
+  fill (sequential write) :   74.509 ms    14.41 GB/s
+  mem type 0     36.71        574  79.7%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+               [DEVICE_LOCAL ] default, separate chunk allocations
+  fill (sequential write) :   61.103 ms    17.57 GB/s
+  mem type 0     36.79        575  79.8%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+               [DEVICE_LOCAL ] default, allocated again
+  fill (sequential write) :   69.521 ms    15.44 GB/s
+  1 alloc t0     36.99        578  80.3%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+               [DEVICE_LOCAL ] one 1024 MiB allocation, chunks bound at offsets
+  fill (sequential write) :   57.684 ms    18.61 GB/s
+  mem type 6     36.83        576  79.9%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+               [DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT HOST_CACHED ]
+  fill (sequential write) :   79.090 ms    13.58 GB/s
+     keep: memory type 0 [DEVICE_LOCAL ], separate chunk allocations
+  -- access size (information: GB/s at other line sizes, not adopted)
+  line 32 B      26.46        827  57.4%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 32 B
+  line 64 B      36.84        576  79.9%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  line 128 B     46.38        362 100.6%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 128 B
+  line 256 B     46.01        180  99.8%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 256 B
+  -- cache-line reuse check for the final shape (window 1 MiB): one 64 B line per 64 / 128 / 256 B
+  1 per 64 B     36.66        573  79.5%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  1 per 128 B    35.19        550  76.4%  T    8192  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B (1 line per 128 B)
+  1 per 256 B    33.81        528  73.4%  T    4096  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B (1 line per 256 B)
+     1 per 128 B / dense = 0.96 (1 per 256 B: 0.92): no cache-line reuse, the window is a true 64 B random read
+
+  -- final (5 runs each)
+  best rand      36.50        570  79.2%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  v1.8 again      5.33         83  11.6%  T  262144  wg  256  unroll  4  16 B/lane  ssbo   sg def  win  64 MiB barrier  line 64 B
+  best as seq    48.30        755 104.8%  T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+
+  driver statistics of the two kernels:
+    v1.8 shape             [Compute Shader] Instruction Count All=827; ALU Instruction Count 32bit=313; ALU Instruction Count 16bit=0; Unified register footprint per shader instance=11; Scratch memory usage per shader instance=0; Max active invocations=2;
+    best rand              [Compute Shader] Instruction Count All=1079; ALU Instruction Count 32bit=450; ALU Instruction Count 16bit=0; Unified register footprint per shader instance=13; Scratch memory usage per shader instance=0; Max active invocations=1;
+  clocks during the tuning: kgsl devfreq 285-818 MHz
+
+==================================== RAND TUNE ====================================
+  -> [PASS] all tuning runs gave the CPU reference checksum
+  READ seq reference 48.30 GB/s
+  v1.8 shape  5.33 GB/s (11.0% of seq)
+  best shape  36.50 GB/s (75.6% of seq, x6.85)   T   16384  wg  256  unroll  4  16 B/lane  ssbo   sg def  win   1 MiB rolling  line 64 B
+  target 70% of seq (33.81 GB/s): REACHED
+  -> [PASS] cache-line reuse check: reading 1 line per 128 B is within 10% of dense at the 1 MiB window - the small window is not a disguised larger-block read
+  every line of the 1024 MiB set is read exactly once per run, in random order inside 1 MiB windows (rolling: workgroups in ID order share a window, one dispatch per chunk)
+  RAND TUNE time: 45 s
+
+==================================== SUMMARY ====================================
+  test                 min GB/s     median        max   verified
+  rand v1.8 shape          5.23       5.33       5.34   yes
+  rand tuned              36.46      36.50      36.70   yes
+
+Checks: 3 total, 0 FAIL, 0 WARN  ->  results verified

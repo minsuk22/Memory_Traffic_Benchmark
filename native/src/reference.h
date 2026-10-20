@@ -8,6 +8,7 @@ namespace ref {
 struct Params {
     uint32_t linesMask, linesBits, vplShift, pattern, seedMix;
     uint32_t keyA[4];
+    uint32_t spreadShift;  // read_tune SPREAD_SHIFT: line i lives at line slot i << spreadShift
 };
 
 inline uint32_t hash32(uint32_t x) {
@@ -51,6 +52,8 @@ inline void readChecksum(const Params& p, uint32_t chunkWordBase, uint32_t logic
                          uint32_t gBegin, uint32_t gEnd, uint32_t acc[2]) {
     for (uint32_t g = gBegin; g < gEnd; ++g) {
         uint32_t vi = vecIndex(p, g, p.keyA);
+        if (p.spreadShift)
+            vi = ((vi >> p.vplShift) << (p.vplShift + p.spreadShift)) | (vi & ((1u << p.vplShift) - 1u));
         uint32_t w  = chunkWordBase + vi * 4u;
         uint32_t v[4] = {dataValue(w, p.seedMix), dataValue(w + 1u, p.seedMix),
                          dataValue(w + 2u, p.seedMix), dataValue(w + 3u, p.seedMix)};
