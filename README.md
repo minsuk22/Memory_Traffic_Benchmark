@@ -138,7 +138,8 @@ bytes should equal the reported traffic (for 64 B lines).
   also *lower* the GPU clocks afterwards; compare `--boost gpu`, `--boost cpu` and `--boost off`.
 * Timing uses GPU timestamps (falls back to CPU wall time when the queue has none).
 * Peak finder (`--peak`, or the **Peak finder** button in the app; needs no adb, so it also
-  works on MDM-managed phones — **Share log** / **Copy log** export the output):
+  works on MDM-managed phones — **Share log** / **Copy log** export the output, and every run
+  is also saved to `Download/membench/membench_<date>_<time>.txt`, readable over USB file transfer):
   1. cold read probe + multi-threaded CPU memcpy (first measurements of the process),
   2. 8 s of continuous sequential reads, bandwidth per second (does it ramp up?),
   3. READ seq over workgroup size {64..1024} x invocations {64K, 256K, 1M},
@@ -193,7 +194,8 @@ bytes should equal the reported traffic (for 64 B lines).
   invocations per dispatch (GPU-wide memory-level parallelism), workgroup size, random lines
   in flight per invocation (`UNROLL` 1..16), bytes one lane loads per line (16 / 32 / 64 B),
   load path (storage buffer vs uniform texel buffer = texture pipe), subgroup size
-  (`VK_EXT_subgroup_size_control`), window size, and — for information only — the access size
+  (`VK_EXT_subgroup_size_control`), window size, the memory allocation (set re-allocated with
+  every device-local memory type, default type twice), and — for information only — the access size
   32..256 B. Kernel: `shaders/read_tune.glsl` (same addresses, data and checksum as
   `read.comp`); every timed run is checked against the CPU reference. If no shape helps but
   larger lines do, the limit is the per-access cost of DRAM (row activations), not the GPU.

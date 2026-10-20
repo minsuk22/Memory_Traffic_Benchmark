@@ -7,7 +7,7 @@
 
 namespace mb {
 
-constexpr const char* kVersion = "1.9";
+constexpr const char* kVersion = "1.10";
 
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set

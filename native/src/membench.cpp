@@ -1,4 +1,4 @@
-﻿#include "membench.h"
+#include "membench.h"
 
 #include <algorithm>
 #include <array>
@@ -243,6 +243,7 @@ private:
     uint32_t vplShift_ = 0;
     uint64_t threadCap_ = 0;
     int dataType_ = -1;
+    int forceMemType_ = -1;  // --rand-tune memory section: allocate chunks from this type
 
     VkBuffer outBuf_ = VK_NULL_HANDLE;
     VkDeviceMemory outMem_ = VK_NULL_HANDLE;
@@ -675,6 +676,7 @@ size_t Bench::allocChunks(size_t n) {
                             never | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
         if (t < 0) t = pickMemType(memProps_, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, never);
         if (t < 0) t = pickMemType(memProps_, mr.memoryTypeBits, 0, never);
+        if (forceMemType_ >= 0 && (mr.memoryTypeBits & (1u << forceMemType_))) t = forceMemType_;
         if (t < 0) throw std::runtime_error("no usable memory type");
         dataType_ = t;
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -2623,8 +2625,8 @@ void Bench::randTune() {
         }
     } res;
     res.d = dev_;
+    const uint32_t nb = texelOk ? 3 : 2;
     {
-        const uint32_t nb = texelOk ? 3 : 2;
         VkDescriptorSetLayoutBinding b[3] = {};
         for (uint32_t i = 0; i < nb; ++i) {
             b[i].binding = i;
@@ -2647,10 +2649,22 @@ void Bench::randTune() {
         VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * n},
                                       {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, n}};
         VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // rebuilt after re-allocation
         dpci.maxSets = n;
         dpci.poolSizeCount = texelOk ? 2 : 1;
         dpci.pPoolSizes = ps;
         VK_CHECK(vkCreateDescriptorPool(dev_, &dpci, nullptr, &res.pool));
+    }
+    // Descriptor sets (and texel views) for the current chunks.
+    auto releaseSets = [&] {
+        vkDeviceWaitIdle(dev_);
+        if (!res.sets.empty()) vkFreeDescriptorSets(dev_, res.pool, uint32_t(res.sets.size()), res.sets.data());
+        for (VkBufferView v : res.views) vkDestroyBufferView(dev_, v, nullptr);
+        res.sets.clear();
+        res.views.clear();
+    };
+    auto bindSets = [&] {
+        releaseSets();
         for (auto& ch : chunks_) {
             VkDescriptorSet set;
             VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -2681,7 +2695,8 @@ void Bench::randTune() {
             }
             vkUpdateDescriptorSets(dev_, nb, w, 0, nullptr);
         }
-    }
+    };
+    bindSets();
 
     struct Cfg {
         uint32_t threads, wg, unroll, vpl, line, sg;  // sg 0 = driver's choice
@@ -2987,6 +3002,67 @@ void Bench::randTune() {
         section("window size", v, true);
     }
     {
+        // The physical pages behind the set (re-allocating gave +15..26% on Adreno 830) and
+        // the memory type. The set is re-allocated, refilled with the same data (so the same
+        // checksums) and measured with the best shape so far.
+        log("  -- memory allocation (set re-allocated and refilled: same data, same checksums)");
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(dev_, chunks_[0].buf, &mr);
+        const int def = dataType_;
+        const size_t n = chunks_.size();
+        std::vector<int> types = {def, def};  // default type twice: allocation-to-allocation spread
+        for (uint32_t i = 0; i < memProps_.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags f = memProps_.memoryTypes[i].propertyFlags;
+            if ((int)i != def && (mr.memoryTypeBits & (1u << i)) && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                !(f & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT)))
+                types.push_back(int(i));
+        }
+        auto realloc = [&](int t) {
+            releaseSets();
+            freeChunks();
+            forceMemType_ = t;
+            size_t got = 0;
+            try {
+                got = allocChunks(n);
+            } catch (const std::exception&) {
+                got = 0;
+            }
+            forceMemType_ = -1;
+            const bool ok = got == n;
+            if (!ok) {  // back to the default type
+                freeChunks();
+                if (allocChunks(n) < n) throw std::runtime_error("re-allocation of the working set failed");
+            }
+            fill(curSeedMix_);
+            bindSets();
+            return ok;
+        };
+        double defBest = 0, top = 0;
+        int topType = def;
+        for (size_t k = 0; k < types.size(); ++k) {
+            const int t = types[k];
+            if (!realloc(t)) {
+                log("  mem type %d: allocation of %zu x %llu MiB failed", t, n, (unsigned long long)(chunkBytes_ / kMiB));
+                continue;
+            }
+            Pt pt = point(best, kRand, 5);
+            row(fmt("mem type %d", t), best, pt);
+            log("               [%s]%s", memFlagsStr(memProps_.memoryTypes[t].propertyFlags).c_str(),
+                k == 0 ? " default" : k == 1 ? " default, allocated again" : "");
+            if (!pt.ok) continue;
+            if (t == def) defBest = std::max(defBest, pt.med);
+            if (pt.med > top) {
+                top = pt.med;
+                topType = t;
+            }
+        }
+        // The rest runs on a fresh allocation of the default type, or of another type that
+        // was > 3% faster.
+        const int use = topType != def && top > defBest * 1.03 ? topType : def;
+        realloc(use);
+        log("     keep: memory type %d [%s]", use, memFlagsStr(memProps_.memoryTypes[use].propertyFlags).c_str());
+    }
+    {
         std::vector<std::pair<std::string, Cfg>> v;
         for (uint32_t ln = 32; ln <= 256; ln *= 2) {
             Cfg c = best;
@@ -3028,6 +3104,8 @@ void Bench::randTune() {
     log("  v1.8 shape  %.2f GB/s (%.1f%% of seq)", again.med, 100.0 * again.med / seqPeak);
     log("  best shape  %.2f GB/s (%.1f%% of seq, x%.2f)   %s", fin.med, 100.0 * fin.med / seqPeak,
         again.med > 0 ? fin.med / again.med : 0.0, cfgStr(best, fin.T).c_str());
+    log("  target 70%% of seq (%.2f GB/s): %s", 0.7 * seqPeak,
+        fin.med >= 0.7 * seqPeak ? "REACHED" : fmt("not reached, %.2f GB/s short", 0.7 * seqPeak - fin.med).c_str());
     log("  reproduce the window with: --window-mb %llu --threads %u --wg %u",
         (unsigned long long)(best.window / kMiB), fin.T, best.wg);
     log("  RAND TUNE time: %.0f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());

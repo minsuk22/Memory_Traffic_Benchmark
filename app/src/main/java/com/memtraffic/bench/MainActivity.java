@@ -107,6 +107,7 @@ public class MainActivity extends Activity {
             int rc = nativeRun(a);
             runOnUiThread(() -> {
                 onLogUi("exit code " + rc);
+                onLogUi("log saved: " + saveLog());
                 run.setEnabled(true);
                 peak.setEnabled(true);
                 cpu.setEnabled(true);
@@ -116,6 +117,31 @@ public class MainActivity extends Activity {
                 tune.setEnabled(true);
             });
         }, "membench").start();
+    }
+
+    /** Writes the log to Download/membench/ (visible over USB file transfer, no permission needed). */
+    private String saveLog() {
+        String name = "membench_" + new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+                .format(new java.util.Date()) + ".txt";
+        byte[] data = logText.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                android.content.ContentValues v = new android.content.ContentValues();
+                v.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name);
+                v.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain");
+                v.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, "Download/membench");
+                android.net.Uri uri = getContentResolver().insert(
+                        android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                if (uri == null) return "not saved (MediaStore insert failed)";
+                try (java.io.OutputStream os = getContentResolver().openOutputStream(uri)) { os.write(data); }
+                return "Download/membench/" + name;
+            }
+            java.io.File f = new java.io.File(getExternalFilesDir(null), name);
+            try (java.io.FileOutputStream os = new java.io.FileOutputStream(f)) { os.write(data); }
+            return f.getAbsolutePath();
+        } catch (Exception e) {
+            return "not saved (" + e + ")";
+        }
     }
 
     private void shareLog() {
