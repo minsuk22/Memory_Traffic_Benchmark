@@ -208,6 +208,20 @@ bytes should equal the reported traffic (for 64 B lines).
 
 ## 6. Results
 
+### Galaxy S25 Ultra (SM-S938N, Snapdragon 8 Elite / Adreno 830, driver 0x80320040)
+
+`--size-mb 1024 --rand-tune` in the app (v1.11, `results/SM-S938N_rand_tune.txt`) — 3/3 checks PASS
+
+| random 64 B read | GB/s | % of READ seq (67.4) |
+|---|---|---|
+| 64 MiB windows, one at a time (v1.8 shape) | 31.7 | 47 % (TLB reach 64..128 MiB) |
+| 1 MiB rolling windows, v1.8 kernel shape (wg 256, unroll 4) | 45.3 | 68 % |
+| **1 MiB rolling, wg 64, unroll 16** | **57.5** | **85 %** |
+| 1 MiB rolling, one line per 128 B (reuse guard) | 55.1 | 0.96 of dense → no cache-line reuse |
+
+Unlike the Adreno 730, the Adreno 830 also profits from the kernel shape once the window is
+small: small workgroups (64) and 16 random lines in flight per invocation (+27 %).
+
 ### Galaxy S22 Ultra (SM-S908N, Snapdragon 8 Gen 1 / Adreno 730, LPDDR5-6400 x64 = 51.2 GB/s peak)
 
 `--size-mb 1024 --rand-tune` (v1.11, `results/SM-S908N_rand_tune.txt`) — all runs verified
