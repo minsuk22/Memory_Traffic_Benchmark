@@ -2209,10 +2209,10 @@ void Bench::cpuSteps() {
         log("  strict mode: every step reads ONE %u B line per %u B block of the %llu MiB set (the other lines of",
             line, o_.strictBytes, mib(bytes));
     else
-        log("  every step reads every %u B line of the %llu MiB set exactly once (--strict %u: neighbouring lines",
-            line, mib(bytes), o_.strictBytes);
+        log("  every step reads every %u B line (= one CPU cache line) of the %llu MiB set exactly once, so",
+            line, mib(bytes));
     log("  %s, in random order (same addresses and data", sp ? "a block are never read, so no cache line serves two reads)"
-                                                               : "of a cache line are read too)");
+                                                               : "no fetched cache line serves two reads");
     log("  as the GPU), checked against the checksum formula; GB/s = bytes really read");
     freeChunks();
     cpu::Buffer buf;
@@ -2336,7 +2336,7 @@ void Bench::cpuSteps() {
     }
 
     // Same as the GPU steps: strict mode excludes cache-line reuse by construction (every
-    // line is shown for comparison); without it, 1 line per 128 B must not be much slower
+    // line is shown for comparison); without it (default), 1 line per 2 lines must not be much slower
     // (else neighbouring lines came from a cache / the adjacent-line prefetcher).
     if (last.win <= 4 * kMiB) {
         const uint32_t other = sp ? 0 : 1;
@@ -2358,7 +2358,7 @@ void Bench::cpuSteps() {
             verdict(ok ? "PASS" : "WARN",
                     ok ? std::string("small areas are not faster because neighbouring lines come from a cache")
                        : std::string("small areas may profit from neighbouring lines in a cache or from the CPU's "
-                                     "adjacent-line prefetcher (> 10% slower with 1 line per 128 B)"));
+                                     "adjacent-line prefetcher (> 10% slower with 1 line per 2 lines)"));
         }
     }
     if (sp)
@@ -3131,11 +3131,11 @@ void Bench::randTune() {
             log("  strict mode: every step reads ONE %u B line per %u B block of the %llu MiB set (the other lines",
                 line0, o_.strictBytes, (unsigned long long)(setBytes / kMiB));
         else
-            log("  every step reads every %u B line of the %llu MiB set exactly once (--strict %u: neighbouring",
-                line0, (unsigned long long)(setBytes / kMiB), o_.strictBytes);
+            log("  every step reads every %u B line (= one GPU cache line) of the %llu MiB set exactly once, so",
+                line0, (unsigned long long)(setBytes / kMiB));
         log("  %s, in random order, checked against the CPU reference; GB/s = bytes really read",
             o_.strictBytes > line0 ? "of a block are never read, so no cache line can serve two reads)"
-                                   : "lines of a cache line are read too)");
+                                   : "no fetched cache line serves two reads or is wasted");
         log("  only WHERE the random addresses may fall is limited, one step at a time");
     } else {
         log("[RAND TUNE] random read inside a TLB-sized window: which kernel / dispatch shape is fastest?");
@@ -3257,9 +3257,9 @@ void Bench::randTune() {
             finalRand_ = {p.med, seqPeak, fmt("step %d: %s", n, st.name.c_str())};
         }
 
-        // Cache lines: in strict mode (default) no two lines read share a --strict block, so
+        // Cache lines: in strict mode (--strict N) no two lines read share a --strict block, so
         // neighbouring lines cannot come from a cache by construction; reading every line is
-        // shown for comparison. Without it (--strict 64), reading only one line per 128 B
+        // shown for comparison. Without it (default), reading only one line per 2 lines
         // must be about as fast as reading all of them.
         if (last.window <= 4 * kMiB) {
             Cfg other = last;
@@ -3278,11 +3278,14 @@ void Bench::randTune() {
                     median(b), ratio);
             } else {
                 const bool reuseOk = ratio >= 0.9;
-                log("  check: only 1 line per 128 B instead of every line, same area -> %.2f x the speed", ratio);
+                log("  check: only 1 line per %u B instead of every line, same area -> %.2f x the speed",
+                    2 * last.line, ratio);
                 verdict(reuseOk ? "PASS" : "WARN",
-                        reuseOk ? std::string("small areas are not faster because neighbouring lines come from a cache")
-                                : std::string("small areas may profit from neighbouring lines in a cache (> 10% slower "
-                                              "with 1 line per 128 B)"));
+                        reuseOk ? std::string("small areas are not faster because neighbouring lines come from a cache "
+                                              "or a neighbour-line prefetch")
+                                : fmt("small areas may profit from neighbouring lines in a cache or a neighbour-line "
+                                      "prefetch (> 10%% slower with 1 line per %u B; --strict %u excludes it)",
+                                      2 * last.line, 4 * last.line));
             }
         }
         if (last.spread)
@@ -3795,7 +3798,7 @@ std::string usage() {
            "  --cpu-steps      the --steps test on the CPU cores: same data, addresses and\n"
            "                   checksums; step 6/7 = software prefetch / tuned threads x prefetch\n"
            "  --strict N       --steps / --cpu-steps read only one line per N B block, so no\n"
-           "                   cache line serves two reads (default 256; <= line = every line)\n"
+           "                   cache line serves two reads (default: every line, see README)\n"
            "  --no-checks      skip the anti-optimisation checks\n"
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
@@ -3849,7 +3852,7 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--cpu-steps") o.cpuSteps = true;
         else if (k == "--strict") {
             if (!next(v)) return false;
-            if (!isPow2(v) || v > 4096) { err = "--strict must be a power of 2 <= 4096 (64 = off)"; return false; }
+            if (!isPow2(v) || v > 4096) { err = "--strict must be a power of 2 <= 4096 (<= line = every line)"; return false; }
             o.strictBytes = uint32_t(v);
         }
         else if (k == "--step") {

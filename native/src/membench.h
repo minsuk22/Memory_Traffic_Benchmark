@@ -7,7 +7,7 @@
 
 namespace mb {
 
-constexpr const char* kVersion = "1.14";
+constexpr const char* kVersion = "1.15";
 
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set
@@ -38,7 +38,7 @@ struct Options {
     bool     steps     = false; // random read with the access pattern constrained step by step (implies randTune)
     int      step      = 0;     // --step N: only that step (1..7), 0 = all
     bool     cpuSteps  = false; // the --steps test on the CPU cores (same data, addresses, checksums)
-    uint32_t strictBytes = 256; // --steps / --cpu-steps: one line per block of this size (= line: every line)
+    uint32_t strictBytes = 0;   // --steps / --cpu-steps: one line per block of this size (0 or <= line: every line)
     bool     oneAlloc  = false; // one memory allocation for the whole working set (chunk buffers at offsets)
     double   peakGBps  = 0;     // theoretical DRAM peak, 0 = unknown
     uint32_t seed      = 0;     // 0 = random per run

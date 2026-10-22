@@ -190,18 +190,20 @@ bytes should equal the reported traffic (for 64 B lines).
   checked against the CPU reference, plus the 1-line-per-128 B cache-reuse check. S22 Ultra
   (app): 1.8 / 3.4 / 26.2 / 28.4 / 29.3 / 33.6 / 33.5 GB/s = 4 % .. 75 % of seq 44.5 GB/s.
   Only step 1 is random over the whole buffer. (These numbers are v1.12, which read every line.)
-  **Strict mode (default since v1.13, `--strict 256`):** every step reads only one 64 B line
-  per 256 B block, in random order; the other three lines of a block are never read, so no
-  cache line (or 128/256 B fetch, or adjacent-line prefetch) can serve two reads. GB/s counts
-  the bytes really read. The last step is also measured reading every line, for comparison.
-  `--strict 128` = one line per 128 B, `--strict 64` = every line (v1.12 behaviour, with the
-  1-line-per-128 B check instead).
-  **Since v1.14** the GPU steps read whole GPU cache lines: 128 B lines on AMD / Samsung
-  Xclipse (Exynos), 64 B elsewhere (`--line N` overrides). With 64 B reads in strict mode a
-  128 B line GPU fetched 128 B per read and threw half away (Exynos step 7: about -40 %
-  against v1.12, Adreno: about -10 %). Each measured run also repeats the strict pattern
-  2^spread times in one submission, so a run is as long as a full read of the set and the
-  memory clock does not drop between short runs.
+  **Line = GPU cache line (since v1.14):** the GPU steps read whole GPU cache lines, 128 B on
+  AMD / Samsung Xclipse (Exynos), 64 B elsewhere (`--line N` overrides). Every line is read
+  exactly once, so no fetched cache line serves two reads and none is half wasted - the same
+  rule on every GPU (v1.15 default). The last step is also measured reading only 1 line per
+  2 lines (check: PASS if that is not > 10 % slower, i.e. no neighbour-line cache or prefetch
+  effect).
+  **Strict mode (`--strict N`, default in v1.13 / v1.14 with N = 256):** one line per N B
+  block, the other lines of a block are never read. Dropped as the default in v1.15: with a
+  fixed 256 B block a 64 B line GPU (Adreno) uses 1/4 of every DRAM row it opens, a 128 B
+  line GPU (Exynos) 1/2, so the GPUs were measured under different conditions (Adreno about
+  -10 % against every line). In v1.13 Exynos also read 64 B lines, fetched 128 B per read and
+  threw half away (step 7 about -40 %). Strict runs repeat the pattern 2^spread times in one
+  submission, so a run is as long as a full read and the memory clock does not drop between
+  short runs.
 * The same steps on the CPU cores (`--cpu-steps`, `--step N` works too; app: switch
   **실행 장치 GPU ⇄ CPU** above the step buttons): host buffer with the same data, the same
   windows, random order and checksum formula; the threads split the windows, so each thread
