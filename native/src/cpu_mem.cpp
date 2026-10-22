@@ -51,7 +51,7 @@ void readRange(const uint32_t* words, const ReadCfg& c, uint32_t chunk, uint32_t
     const uint32_t logicalBase = uint32_t(uint64_t(chunk) * (uint64_t(c.passes) << (c.linesBits + c.vplShift)));
     auto lineOf = [&](uint32_t lineL) { return ref::permuteLine(p, lineL & p.linesMask, k, lineL >> c.linesBits); };
     auto prefetchLine = [&](uint32_t line) {
-        const char* a = reinterpret_cast<const char*>(base + uint64_t(line) * lineWords);
+        const char* a = reinterpret_cast<const char*>(base + (uint64_t(line) << c.spread) * lineWords);
         for (uint32_t o = 0; o < lineWords * 4u; o += 64u) __builtin_prefetch(a + o);
     };
 
@@ -78,7 +78,7 @@ void readRange(const uint32_t* words, const ReadCfg& c, uint32_t chunk, uint32_t
         } else {
             line = lineOf(lineL);
         }
-        const uint32_t* v = base + uint64_t(line) * lineWords;
+        const uint32_t* v = base + (uint64_t(line) << c.spread) * lineWords;
         const uint32_t g = logicalBase + (lineL << c.vplShift);
         for (uint32_t s = 0; s < vpl; ++s) mix(a0, a1, v + 4u * s, g + s);
         if (DEP) dep = v[0];
@@ -190,6 +190,7 @@ void expectedChecksum(const ReadCfg& c, uint32_t out[2]) {
             forEachRange(c, t, nt, [&](uint32_t chunk, uint32_t lb, uint32_t le) {
                 ref::Params p{(1u << c.linesBits) - 1u, c.linesBits, c.vplShift, 1u, c.seedMix, {}};
                 std::memcpy(p.keyA, c.keys[chunk].data(), sizeof p.keyA);
+                p.spreadShift = c.spread;
                 const uint32_t logicalBase =
                     uint32_t(uint64_t(chunk) * (uint64_t(c.passes) << (c.linesBits + c.vplShift)));
                 ref::readChecksum(p, uint32_t(uint64_t(chunk) * c.chunkWords), logicalBase, lb << c.vplShift,

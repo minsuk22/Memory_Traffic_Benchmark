@@ -45,6 +45,7 @@ struct ReadCfg {
     unsigned threads = 1;
     uint32_t prefetch = 0;   // software prefetch distance in lines (power of two <= 256), 0 = off
     bool dependent = false;  // next address depends on the previous load (latency test)
+    uint32_t spread = 0;     // line i lives at line slot i << spread (cache-line reuse check)
 };
 
 struct ReadResult {

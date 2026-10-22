@@ -189,7 +189,20 @@ bytes should equal the reported traffic (for 64 B lines).
   7 = step 6 + best workgroup size / lines in flight. Every step reads every 64 B line once,
   checked against the CPU reference, plus the 1-line-per-128 B cache-reuse check. S22 Ultra
   (app): 1.8 / 3.4 / 26.2 / 28.4 / 29.3 / 33.6 / 33.5 GB/s = 4 % .. 75 % of seq 44.5 GB/s.
-  Only step 1 is random over the whole buffer.
+  Only step 1 is random over the whole buffer. (These numbers are v1.12, which read every line.)
+  **Strict mode (default since v1.13, `--strict 256`):** every step reads only one 64 B line
+  per 256 B block, in random order; the other three lines of a block are never read, so no
+  cache line (or 128/256 B fetch, or adjacent-line prefetch) can serve two reads. GB/s counts
+  the bytes really read. The last step is also measured reading every line, for comparison.
+  `--strict 128` = one line per 128 B, `--strict 64` = every line (v1.12 behaviour, with the
+  1-line-per-128 B check instead).
+* The same steps on the CPU cores (`--cpu-steps`, `--step N` works too; app: switch
+  **실행 장치 GPU ⇄ CPU** above the step buttons): host buffer with the same data, the same
+  windows, random order and checksum formula; the threads split the windows, so each thread
+  works inside its own area. Steps 6 / 7 are CPU-specific: software prefetch 16 lines ahead,
+  then the best thread count x prefetch distance. Sequential reference: all cores
+  stream-read the buffer. Same 1-line-per-128 B check (also catches the adjacent-line
+  prefetcher).
 * Every mode ends with one line `RANDOM READ <GB/s> = <%> of seq <GB/s> [what]`.
 * Random read inside the TLB reach (`--window-mb N`): the working
   set is split into N MiB chunks, every random pass stays inside one chunk and the chunks run

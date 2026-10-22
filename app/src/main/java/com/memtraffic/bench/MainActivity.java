@@ -25,7 +25,8 @@ import java.util.List;
  * Launch with arguments from adb:
  *   adb shell am start -n com.memtraffic.bench/.MainActivity --es args "--size-mb 1024 --steps"
  * Menu, top to bottom: random read with the access pattern constrained step by step
- * (--steps, or one step with --step N), then the other measurements (normal benchmark,
+ * (--steps, or one step with --step N; the GPU/CPU switch runs the same test on the CPU
+ * cores with --cpu-steps), then the other measurements (normal benchmark,
  * --rand-tune, and the diagnosis modes --peak / --cpu / --dvfs / --matrix under "Advanced").
  * The last line of every log is the random read result. "Share log" / "Copy log" hand the
  * complete output to any app; every log is also saved to Download/membench/.
@@ -52,17 +53,19 @@ public class MainActivity extends Activity {
         root.setPadding(24, 24, 24, 24);
 
         title(root, "Random read: 접근 범위를 한 단계씩 좁히기");
+        // The step buttons run on the GPU (--steps) or, switched, the same test on the CPU
+        // cores (--cpu-steps); steps 6 and 7 differ between the two.
         LinearLayout r0 = row(root);
-        runButton(r0, "전체 단계 1 → 7 실행 (약 1분)", "--steps");
+        final Button dev = button(r0, "", null);
+        runButtons.add(dev);
+        stepButton(r0, 0);
+        ((LinearLayout.LayoutParams) r0.getChildAt(1).getLayoutParams()).weight = 2f;
         LinearLayout r1 = row(root);
-        runButton(r1, "1\n제한 없음", "--step 1");
-        runButton(r1, "2\n64 MiB", "--step 2");
-        runButton(r1, "3\n16 MiB", "--step 3");
-        runButton(r1, "4\n4 MiB", "--step 4");
+        for (int s = 1; s <= 4; ++s) stepButton(r1, s);
         LinearLayout r2 = row(root);
-        runButton(r2, "5\n1 MiB", "--step 5");
-        runButton(r2, "6\n1 MiB 동시", "--step 6");
-        runButton(r2, "7\n+ 커널 튜닝", "--step 7");
+        for (int s = 5; s <= 7; ++s) stepButton(r2, s);
+        dev.setOnClickListener(v -> { onCpu = !onCpu; updateStepLabels(dev); });
+        updateStepLabels(dev);
 
         title(root, "기타 측정");
         LinearLayout r3 = row(root);
@@ -132,6 +135,26 @@ public class MainActivity extends Activity {
     /** A button that runs the benchmark with the option field plus `mode`. */
     private void runButton(LinearLayout row, String text, String mode) {
         runButtons.add(button(row, text, v -> start(args.getText().toString() + " " + mode)));
+    }
+
+    private static final String[] STEP_GPU = {"전체 단계 1 → 7 실행 (약 1분)", "1\n제한 없음", "2\n64 MiB", "3\n16 MiB",
+            "4\n4 MiB", "5\n1 MiB", "6\n1 MiB 동시", "7\n+ 커널 튜닝"};
+    private static final String[] STEP_CPU = {"CPU로 전체 단계 1 → 7 실행", "1\n제한 없음", "2\n64 MiB", "3\n16 MiB",
+            "4\n4 MiB", "5\n1 MiB", "6\n+ prefetch", "7\n+ 스레드 튜닝"};
+    private boolean onCpu = false;
+    private final Button[] stepButtons = new Button[8];
+
+    /** Step s (1..7), or all steps for s = 0, on the device chosen with the GPU/CPU switch. */
+    private void stepButton(LinearLayout row, int s) {
+        Button b = button(row, "", v -> start(args.getText().toString() + (onCpu ? " --cpu-steps" : " --steps")
+                + (s > 0 ? " --step " + s : "")));
+        stepButtons[s] = b;
+        runButtons.add(b);
+    }
+
+    private void updateStepLabels(Button dev) {
+        dev.setText(onCpu ? "실행 장치\nCPU ⇄" : "실행 장치\nGPU ⇄");
+        for (int s = 0; s < 8; ++s) stepButtons[s].setText((onCpu ? STEP_CPU : STEP_GPU)[s]);
     }
 
     private void setRunning(boolean running) {
