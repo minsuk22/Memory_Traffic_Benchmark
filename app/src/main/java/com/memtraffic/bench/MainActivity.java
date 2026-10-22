@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
@@ -15,24 +16,29 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Minimal UI around the native benchmark. Arguments are the same as the CLI
  * (see `membench --help`). Output is also written to logcat with tag "membench".
  * Launch with arguments from adb:
- *   adb shell am start -n com.memtraffic.bench/.MainActivity --es args "--size-mb 1024 --sweep"
- * Without adb (e.g. devices managed by an MDM), "Peak finder" / "CPU random" / "Rand vs DVFS" / "Rand + matrix" / "Rand in 64 MiB" / "Rand tuning" run
- * --peak / --cpu / --dvfs / --matrix / --window-mb 64 / --rand-tune;
- * "Share log" / "Copy log" hand the complete output to any app.
+ *   adb shell am start -n com.memtraffic.bench/.MainActivity --es args "--size-mb 1024 --steps"
+ * Menu, top to bottom: random read with the access pattern constrained step by step
+ * (--steps, or one step with --step N), then the other measurements (normal benchmark,
+ * --rand-tune, and the diagnosis modes --peak / --cpu / --dvfs / --matrix under "Advanced").
+ * The last line of every log is the random read result. "Share log" / "Copy log" hand the
+ * complete output to any app; every log is also saved to Download/membench/.
  */
 public class MainActivity extends Activity {
     static { System.loadLibrary("membench_jni"); }
 
     private native int nativeRun(String args);
 
-    private TextView out;
+    private TextView out, status;
     private ScrollView scroll;
-    private Button run, peak, cpu, dvfs, mat, win, tune, share, copy;
     private EditText args;
+    private final List<Button> runButtons = new ArrayList<>();
     private final StringBuilder logText = new StringBuilder();
 
     @Override
@@ -45,27 +51,46 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(24, 24, 24, 24);
 
+        title(root, "Random read: 접근 범위를 한 단계씩 좁히기");
+        LinearLayout r0 = row(root);
+        runButton(r0, "전체 단계 1 → 7 실행 (약 1분)", "--steps");
+        LinearLayout r1 = row(root);
+        runButton(r1, "1\n제한 없음", "--step 1");
+        runButton(r1, "2\n64 MiB", "--step 2");
+        runButton(r1, "3\n16 MiB", "--step 3");
+        runButton(r1, "4\n4 MiB", "--step 4");
+        LinearLayout r2 = row(root);
+        runButton(r2, "5\n1 MiB", "--step 5");
+        runButton(r2, "6\n1 MiB 동시", "--step 6");
+        runButton(r2, "7\n+ 커널 튜닝", "--step 7");
+
+        title(root, "기타 측정");
+        LinearLayout r3 = row(root);
+        runButton(r3, "기본 측정\nread/write/copy", "");
+        runButton(r3, "자동 튜닝\n(rand-tune)", "--rand-tune");
+        final LinearLayout adv = new LinearLayout(this);
+        button(r3, "고급 진단 ▼", v -> adv.setVisibility(adv.getVisibility() == View.GONE ? View.VISIBLE : View.GONE));
+        runButton(adv, "Peak", "--peak");
+        runButton(adv, "CPU", "--cpu");
+        runButton(adv, "DVFS", "--dvfs");
+        runButton(adv, "Matrix", "--matrix");
+        adv.setVisibility(View.GONE);
+        root.addView(adv);
+
+        LinearLayout r4 = row(root);
         args = new EditText(this);
         args.setSingleLine(true);
+        args.setTextSize(12f);
+        args.setHint("추가 옵션 (CLI와 동일)");
         String extra = getIntent().getStringExtra("args");
-        args.setText(extra != null ? extra : "--size-mb 1024");
-        root.addView(args);
+        args.setText("--size-mb 1024");
+        r4.addView(args, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2f));
+        button(r4, "로그 공유", v -> shareLog());
+        button(r4, "로그 복사", v -> copyLog());
 
-        LinearLayout row1 = new LinearLayout(this);
-        run = button(row1, "Run benchmark", v -> start(args.getText().toString()));
-        peak = button(row1, "Peak finder", v -> start(args.getText().toString() + " --peak"));
-        cpu = button(row1, "CPU random", v -> start(args.getText().toString() + " --cpu"));
-        root.addView(row1);
-        LinearLayout row2 = new LinearLayout(this);
-        dvfs = button(row2, "Rand vs DVFS", v -> start(args.getText().toString() + " --dvfs"));
-        mat = button(row2, "Rand + matrix", v -> start(args.getText().toString() + " --matrix"));
-        win = button(row2, "Rand in 64 MiB", v -> start(args.getText().toString() + " --window-mb 64"));
-        root.addView(row2);
-        LinearLayout row3 = new LinearLayout(this);
-        tune = button(row3, "Rand tuning", v -> start(args.getText().toString() + " --rand-tune"));
-        share = button(row3, "Share log", v -> shareLog());
-        copy = button(row3, "Copy log", v -> copyLog());
-        root.addView(row3);
+        status = new TextView(this);
+        status.setTextSize(11f);
+        root.addView(status);
 
         scroll = new ScrollView(this);
         out = new TextView(this);
@@ -80,23 +105,42 @@ public class MainActivity extends Activity {
         if (extra != null) start(extra);  // started from adb with --es args: run immediately
     }
 
-    private Button button(LinearLayout row, String text, android.view.View.OnClickListener l) {
+    private void title(LinearLayout root, String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setPadding(0, 16, 0, 4);
+        root.addView(t);
+    }
+
+    private LinearLayout row(LinearLayout root) {
+        LinearLayout r = new LinearLayout(this);
+        root.addView(r);
+        return r;
+    }
+
+    private Button button(LinearLayout row, String text, View.OnClickListener l) {
         Button b = new Button(this);
         b.setText(text);
         b.setAllCaps(false);
+        b.setTextSize(12f);
         b.setOnClickListener(l);
         row.addView(b, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         return b;
     }
 
+    /** A button that runs the benchmark with the option field plus `mode`. */
+    private void runButton(LinearLayout row, String text, String mode) {
+        runButtons.add(button(row, text, v -> start(args.getText().toString() + " " + mode)));
+    }
+
+    private void setRunning(boolean running) {
+        for (Button b : runButtons) b.setEnabled(!running);
+    }
+
     private void start(final String a) {
-        run.setEnabled(false);
-        peak.setEnabled(false);
-        cpu.setEnabled(false);
-        dvfs.setEnabled(false);
-        mat.setEnabled(false);
-        win.setEnabled(false);
-        tune.setEnabled(false);
+        setRunning(true);
+        status.setText("측정 중... (" + a.trim() + ")");
         out.setText("");
         logText.setLength(0);
         logText.append("device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
@@ -106,15 +150,10 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             int rc = nativeRun(a);
             runOnUiThread(() -> {
-                onLogUi("exit code " + rc);
-                onLogUi("log saved: " + saveLog());
-                run.setEnabled(true);
-                peak.setEnabled(true);
-                cpu.setEnabled(true);
-                dvfs.setEnabled(true);
-                mat.setEnabled(true);
-                win.setEnabled(true);
-                tune.setEnabled(true);
+                // Kept out of the log so its last line stays the random read result.
+                status.setText((rc == 0 ? "완료" : rc == 1 ? "완료 - 실패한 검사 있음" : "오류")
+                        + " (exit " + rc + "), 로그 저장: " + saveLog());
+                setRunning(false);
             });
         }, "membench").start();
     }

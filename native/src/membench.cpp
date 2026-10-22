@@ -294,6 +294,11 @@ private:
 
     std::vector<Row> rows_;
     std::vector<std::pair<std::string, std::string>> verdicts_;
+    // Random read result printed as the very last line (set by a mode, else taken from rows_).
+    struct FinalRand {
+        double gbps = 0, seq = 0;
+        std::string what;
+    } finalRand_;
 };
 
 void Bench::log(const char* f, ...) {
@@ -2914,12 +2919,19 @@ void Bench::randTune() {
     };
 
     log("");
-    log("[RAND TUNE] random read inside a TLB-sized window: which kernel / dispatch shape is fastest?");
-    log("  every row: whole %llu MiB set, one dispatch per window, every run checked against the CPU reference",
-        (unsigned long long)(setBytes / kMiB));
-    log("  T = invocations per dispatch, unroll = random lines in flight per invocation, B/lane = bytes one");
-    log("  invocation loads per line, texel = texture pipe instead of storage buffer, sg = subgroup size");
-    if (!texelOk)
+    if (o_.steps) {
+        log("[STEPS] random read, the access pattern constrained one step at a time");
+        log("  every step reads every 64 B line of the %llu MiB set exactly once, in random order, and is",
+            (unsigned long long)(setBytes / kMiB));
+        log("  checked against the CPU reference; only WHERE the random addresses may fall is limited");
+    } else {
+        log("[RAND TUNE] random read inside a TLB-sized window: which kernel / dispatch shape is fastest?");
+        log("  every row: whole %llu MiB set, one dispatch per window, every run checked against the CPU reference",
+            (unsigned long long)(setBytes / kMiB));
+        log("  T = invocations per dispatch, unroll = random lines in flight per invocation, B/lane = bytes one");
+        log("  invocation loads per line, texel = texture pipe instead of storage buffer, sg = subgroup size");
+    }
+    if (!texelOk && !o_.steps)
         log("  texel path skipped: chunk of %llu texels > maxTexelBufferElements %u",
             (unsigned long long)(chunkBytes_ / 16), props_.limits.maxTexelBufferElements);
     const auto clocks = cpu::findClockFiles();
@@ -2942,6 +2954,132 @@ void Bench::randTune() {
         log("");
         log("  READ seq reference: read.comp %.2f GB/s, tuning kernel %.2f GB/s (1M invocations) -> %.2f GB/s = 100%%",
             s.med, t.med, seqPeak);
+    }
+
+    // --- steps (--steps / --step N): each step adds one constraint on where the random
+    // addresses may fall (or, for 6 and 7, on how the GPU works through them) ---
+    if (o_.steps) {
+        struct Step {
+            std::string name, rule, why;
+            Cfg c;
+            bool tune = false;
+        };
+        auto mib = [](uint64_t b) { return (unsigned long long)(b / kMiB); };
+        Cfg s0 = base;
+        s0.threads = 1u << 20;
+        std::vector<Step> steps;
+        {
+            Cfg c = s0;
+            c.window = chunkBytes_;
+            steps.push_back({fmt("whole %llu MiB", mib(chunkBytes_)),
+                             fmt("anywhere in a %llu MiB buffer (= the normal benchmark)", mib(chunkBytes_)),
+                             "almost every access goes to a new page: GPU address translation (TLB) misses", c});
+        }
+        const char* why[4] = {"64 MiB fits the GPU TLB of newer GPUs (Adreno 830: 64-128 MiB, Adreno 730: 32-64 MiB)",
+                              "16 MiB fits the GPU TLB of every GPU tested so far",
+                              "even fewer pages (and DRAM rows) per area",
+                              "smallest area, but one small area at a time: the GPU waits at every area switch"};
+        int k = 0;
+        for (uint64_t w : {64 * kMiB, 16 * kMiB, 4 * kMiB, kMiB}) {
+            Cfg c = s0;
+            c.window = std::min(w, chunkBytes_);
+            steps.push_back({fmt("%llu MiB areas", mib(c.window)),
+                             fmt("only inside one %llu MiB area at a time, then the next area", mib(c.window)), why[k++],
+                             c});
+        }
+        Cfg r = s0;
+        r.window = std::min(kMiB, chunkBytes_);
+        r.roll = true;
+        steps.push_back({"1 MiB, many at once", "1 MiB areas, but many areas worked on at the same time",
+                         "same small areas, no waiting between them (one dispatch per buffer)", r});
+        steps.push_back({"+ tuned kernel", "step 6 + best workgroup size and random lines in flight per thread",
+                         "more random reads in flight hide the DRAM latency", r, true});
+
+        struct Done {
+            int i;
+            double med;
+        };
+        std::vector<Done> done;
+        Cfg last = s0;
+        bool allOk = true;
+        for (size_t i = 0; i < steps.size(); ++i) {
+            const int n = int(i) + 1;
+            if (o_.step && o_.step != n) continue;
+            Step& st = steps[i];
+            Cfg c = st.c;
+            log("");
+            log("  step %d  %s", n, st.name.c_str());
+            log("          rule: %s", st.rule.c_str());
+            log("          why : %s", st.why.c_str());
+            if (st.tune) {
+                double top = 0;
+                for (uint32_t wg : {64u, 128u, 256u})
+                    for (uint32_t u : {4u, 8u, 16u}) {
+                        if (wg > maxWg) continue;
+                        Cfg t = c;
+                        t.wg = wg;
+                        t.unroll = u;
+                        Pt p = point(t, kRand, 2);
+                        if (!p.ran) continue;
+                        allOk &= p.ok;
+                        log("          try wg %4u  lines in flight %2u : %7.2f GB/s%s", wg, u, p.med,
+                            p.ok ? "" : "  CHECKSUM MISMATCH");
+                        if (p.ok && p.med > top) {
+                            top = p.med;
+                            st.c = t;
+                        }
+                    }
+                c = st.c;
+            }
+            Pt p = point(c, kRand, std::max(o_.reps, 5));
+            allOk &= p.ok;
+            const double x1 = done.empty() || done[0].i != 1 ? 0 : p.med / done[0].med;
+            log("          -> %7.2f GB/s  = %5.1f%% of seq%s   (wg %u, lines in flight %u, %u threads)%s", p.med,
+                100.0 * p.med / seqPeak, x1 > 0 ? fmt("  x%.1f vs step 1", x1).c_str() : "", c.wg, c.unroll, p.T,
+                p.ok ? "" : "  CHECKSUM MISMATCH");
+            rows_.push_back({fmt("step %d %s", n, st.name.c_str()), p.runs, p.ok});
+            done.push_back({n, p.med});
+            last = c;
+            finalRand_ = {p.med, seqPeak, fmt("step %d: %s", n, st.name.c_str())};
+        }
+
+        // Small areas must not read neighbouring lines from a cache: reading only one line
+        // per 128 B block (the others skipped) must be about as fast as reading all of them.
+        bool reuseOk = true;
+        if (last.window <= 4 * kMiB) {
+            Cfg half = last;
+            half.spread = 1;
+            std::vector<double> a, b;
+            for (int round = 0; round < 3; ++round) {
+                Pt p0 = point(last, kRand, 2), p1 = point(half, kRand, 2);
+                allOk &= p0.ok && p1.ok;
+                a.insert(a.end(), p0.runs.begin(), p0.runs.end());
+                b.insert(b.end(), p1.runs.begin(), p1.runs.end());
+            }
+            const double ratio = median(a) > 0 ? median(b) / median(a) : 0;
+            reuseOk = ratio >= 0.9;
+            log("");
+            log("  check: only 1 line per 128 B instead of every line, same area -> %.2f x the speed", ratio);
+            verdict(reuseOk ? "PASS" : "WARN",
+                    reuseOk ? std::string("small areas are not faster because neighbouring lines come from a cache")
+                            : std::string("small areas may profit from neighbouring lines in a cache (> 10% slower "
+                                          "with 1 line per 128 B)"));
+        }
+        log("  clocks: %s", clocks.empty() ? "(no readable clock files)" : sampler.stop().c_str());
+
+        log("");
+        log("==================================== STEPS ====================================");
+        verdict(allOk ? "PASS" : "FAIL", allOk ? std::string("every run gave the CPU reference checksum")
+                                               : std::string("a run gave a wrong checksum or dropped workgroups"));
+        log("  READ seq (reference)       %7.2f GB/s  100%%", seqPeak);
+        for (const Done& d : done) {
+            const double pc = 100.0 * d.med / seqPeak;
+            log("  step %d %-19s %7.2f GB/s %5.1f%%  %s", d.i, steps[d.i - 1].name.c_str(), d.med, pc,
+                std::string(size_t(std::min(25.0, std::max(0.0, pc / 4))), '#').c_str());
+        }
+        if (done.size() > 1 && done[0].i == 1)
+            log("  step 1 is random over the whole buffer; steps 2-7 are random only inside small areas");
+        return;
     }
     log("");
     log("  %-12s %7s %10s %6s  %s", "", "GB/s", "M acc/s", "% seq", "configuration");
@@ -3242,6 +3380,8 @@ void Bench::randTune() {
     seqPeak = std::max(seqPeak, seqBest.med);  // the final ratios use the best sequential seen
     rows_.push_back({"rand v1.8 shape", again.runs, again.ok});
     rows_.push_back({"rand tuned", fin.runs, fin.ok});
+    finalRand_ = {fin.med, seqPeak, fmt("tuned, %llu MiB %s windows", (unsigned long long)(best.window / kMiB),
+                                        best.roll ? "rolling" : "one-at-a-time")};
     if (statsExt_) {
         log("");
         log("  driver statistics of the two kernels:");
@@ -3281,13 +3421,15 @@ void Bench::randTune() {
 int Bench::summary() {
     log("");
     log("==================================== SUMMARY ====================================");
-    log("  %-18s %10s %10s %10s   %s", "test", "min GB/s", "median", "max", "verified");
+    int nw = 18;
+    for (auto& r : rows_) nw = std::max(nw, int(r.name.size()));
+    log("  %-*s %10s %10s %10s   %s", nw, "test", "min GB/s", "median", "max", "verified");
     double bestAll = 0;
     for (auto& r : rows_) {
         if (r.gbps.empty()) continue;
         auto mm = std::minmax_element(r.gbps.begin(), r.gbps.end());
         bestAll = std::max(bestAll, *mm.second);
-        log("  %-18s %10.2f %10.2f %10.2f   %s", r.name.c_str(), *mm.first, median(r.gbps), *mm.second,
+        log("  %-*s %10.2f %10.2f %10.2f   %s", nw, r.name.c_str(), *mm.first, median(r.gbps), *mm.second,
             r.verified ? "yes" : "NO");
     }
     if (o_.peakGBps > 0) {
@@ -3306,6 +3448,23 @@ int Bench::summary() {
     log("");
     log("Checks: %zu total, %d FAIL, %d WARN  ->  %s", verdicts_.size(), fails, warns,
         fails ? "RESULTS ARE NOT TRUSTWORTHY" : "results verified");
+
+    // Last line: the random read result alone (the mode's own, else the first random row).
+    FinalRand f = finalRand_;
+    for (auto& r : rows_) {
+        if (r.gbps.empty()) continue;
+        if (f.gbps <= 0 && r.name.find("rand") != std::string::npos) {
+            f.gbps = median(r.gbps);
+            f.what = r.name;
+        }
+        if (f.seq <= 0 && r.name.find("READ") != std::string::npos && r.name.find("seq") != std::string::npos)
+            f.seq = median(r.gbps);
+    }
+    if (f.gbps > 0) {
+        log("");
+        log("RANDOM READ  %.2f GB/s%s  [%s]", f.gbps,
+            f.seq > 0 ? fmt("  = %.1f%% of seq %.2f GB/s", 100.0 * f.gbps / f.seq, f.seq).c_str() : "", f.what.c_str());
+    }
     return fails ? 1 : 0;
 }
 
@@ -3404,6 +3563,10 @@ std::string usage() {
            "  --rand-tune      random read tuning inside a 64 MiB window (or --window-mb):\n"
            "                   invocations, workgroup, lines in flight per invocation, bytes\n"
            "                   per lane, storage vs texel buffer, subgroup size, window, line\n"
+           "  --steps          random read with the access pattern constrained step by step:\n"
+           "                   1 whole buffer, 2-5 areas of 64/16/4/1 MiB one at a time,\n"
+           "                   6 many 1 MiB areas at once, 7 + tuned kernel shape (~1 min)\n"
+           "  --step N         only step N of --steps (1..7)\n"
            "  --no-checks      skip the anti-optimisation checks\n"
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
@@ -3453,6 +3616,13 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--dvfs") o.dvfs = true;
         else if (k == "--matrix") o.matrix = true;
         else if (k == "--rand-tune") o.randTune = true;
+        else if (k == "--steps") o.steps = o.randTune = true;
+        else if (k == "--step") {
+            if (!next(v)) return false;
+            if (v < 1 || v > 7) { err = "--step must be 1..7"; return false; }
+            o.steps = o.randTune = true;
+            o.step = int(v);
+        }
         else if (k == "--one-alloc") o.oneAlloc = true;
         else if (k == "--no-checks") o.checks = false;
         else if (k == "--no-cpu-ref") o.cpuRef = false;

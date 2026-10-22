@@ -182,7 +182,16 @@ bytes should equal the reported traffic (for 64 B lines).
   byte per rep) at 1 MiB (cache resident = compute ceiling), 64 MiB and the whole set. If the
   whole-set column stays flat while GFLOP/s grows, the GPU cores are waiting for memory, not
   limiting the random read.
-* Random read inside the TLB reach (`--window-mb N`, app button **Rand in 64 MiB**): the working
+* Random read step by step (`--steps`, or one step with `--step N`; app: top section, buttons
+  1-7 or **전체 단계 1 → 7 실행**, ~1 min): each step adds one constraint and shows how much
+  faster random read gets. 1 = anywhere in a buffer (the normal benchmark), 2-5 = only inside
+  one 64 / 16 / 4 / 1 MiB area at a time, 6 = many 1 MiB areas at once (rolling windows),
+  7 = step 6 + best workgroup size / lines in flight. Every step reads every 64 B line once,
+  checked against the CPU reference, plus the 1-line-per-128 B cache-reuse check. S22 Ultra
+  (app): 1.8 / 3.4 / 26.2 / 28.4 / 29.3 / 33.6 / 33.5 GB/s = 4 % .. 75 % of seq 44.5 GB/s.
+  Only step 1 is random over the whole buffer.
+* Every mode ends with one line `RANDOM READ <GB/s> = <%> of seq <GB/s> [what]`.
+* Random read inside the TLB reach (`--window-mb N`): the working
   set is split into N MiB chunks, every random pass stays inside one chunk and the chunks run
   one after another (barrier between them), so at most N MiB are accessed randomly at any time
   while the whole set is still read once per pass. Choose N below the footprint where the

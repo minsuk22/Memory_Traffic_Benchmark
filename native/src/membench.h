@@ -7,7 +7,7 @@
 
 namespace mb {
 
-constexpr const char* kVersion = "1.11";
+constexpr const char* kVersion = "1.12";
 
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set
@@ -34,6 +34,8 @@ struct Options {
     bool     dvfs      = false; // random read vs memory clock governors (background traffic, slices, footprint)
     bool     matrix    = false; // random read feeding matrix math (cooperative matrix or ALU)
     bool     randTune  = false; // random read tuning inside a TLB-sized window (kernel shape, dispatch, load path)
+    bool     steps     = false; // random read with the access pattern constrained step by step (implies randTune)
+    int      step      = 0;     // --step N: only that step (1..7), 0 = all
     bool     oneAlloc  = false; // one memory allocation for the whole working set (chunk buffers at offsets)
     double   peakGBps  = 0;     // theoretical DRAM peak, 0 = unknown
     uint32_t seed      = 0;     // 0 = random per run
