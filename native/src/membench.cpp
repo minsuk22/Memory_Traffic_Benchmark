@@ -558,6 +558,10 @@ std::string memFlagsStr(VkMemoryPropertyFlags f) {
 
 void Bench::createResources() {
     // --- sizes -----------------------------------------------------------------------
+    // --steps reads whole GPU cache lines: with 64 B reads on a 128 B line GPU (AMD RDNA,
+    // Samsung Xclipse) half of every line fetched in strict mode would be thrown away.
+    if (o_.steps && !o_.lineSet)
+        o_.lineBytes = (props_.vendorID == 0x1002 || props_.vendorID == 0x144D) ? 128 : 64;
     if (!isPow2(o_.lineBytes) || o_.lineBytes < 16 || o_.lineBytes > 4096)
         throw std::runtime_error("--line must be a power of two in [16, 4096]");
     if (o_.strictBytes < o_.lineBytes) o_.strictBytes = o_.lineBytes;  // --strict below the line = every line
@@ -3009,8 +3013,9 @@ void Bench::randTune() {
 
     // One run over the whole set. Default: one dispatch per window, a barrier between
     // windows. Rolling: one dispatch for all windows of a chunk (fewer if the workgroup
-    // count limit is reached), a barrier only between those dispatches.
-    auto runOnce = [&](const Cfg& c, VkPipeline p, uint32_t pattern) {
+    // count limit is reached), a barrier only between those dispatches. passes > 1 repeats the
+    // whole set inside one submission (checksums and workgroup counts add up per pass).
+    auto runOnce = [&](const Cfg& c, VkPipeline p, uint32_t pattern, uint32_t passes = 1) {
         uint32_t T, iters;
         shape(c, T, iters);
         const uint64_t vecs = (c.window / 16) >> c.spread, perChunk = chunkBytes_ / c.window,
@@ -3021,10 +3026,11 @@ void Bench::randTune() {
         uint64_t groups = 0;
         JobResult r = submitTimed([&] {
             vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+            for (uint32_t pass = 0; pass < passes; ++pass)
             for (uint64_t w = 0; w < nWin;) {
                 const uint64_t ch = w / perChunk, off = (w % perChunk) * c.window;
                 const uint64_t nw = std::min(step, perChunk - w % perChunk);
-                if (w) computeBarrier();  // between all dispatches (driver workaround, see execute())
+                if (w || pass) computeBarrier();  // between all dispatches (driver workaround, see execute())
                 Push pc{};
                 pc.chunkWordBase = uint32_t(ch * (chunkBytes_ / 4) + off / 4);
                 pc.logicalBase = uint32_t(w * vecs);
@@ -3093,10 +3099,13 @@ void Bench::randTune() {
         uint32_t iters;
         shape(c, pt.T, iters);
         pt.ok = true;
+        // Strict mode reads 1 / 2^spread of the set: that many passes per run keep a run as
+        // long as a full read, so short runs do not leave the memory clock behind.
+        const uint32_t passes = 1u << c.spread;
         for (int i = 0; i <= reps; ++i) {  // run 0 is discarded (but checked)
-            JobResult r = runOnce(c, p, pattern);
-            pt.ok &= r.chkX == ref[0] && r.chkY == ref[1] && r.wgDone == r.wgExpected;
-            if (i) pt.runs.push_back(double(setBytes >> c.spread) / (r.ms() * 1e6));
+            JobResult r = runOnce(c, p, pattern, passes);
+            pt.ok &= r.chkX == passes * ref[0] && r.chkY == passes * ref[1] && r.wgDone == r.wgExpected;
+            if (i) pt.runs.push_back(double(passes * (setBytes >> c.spread)) / (r.ms() * 1e6));
         }
         pt.ran = true;
         pt.med = median(pt.runs);
@@ -3754,7 +3763,8 @@ std::string usage() {
            "  --chunk-mb N     buffer chunk size in MiB (default auto, <= 256)\n"
            "  --window-mb N    random accesses stay inside N MiB windows (chunks), one window\n"
            "                   at a time: random read without GPU TLB misses (e.g. 64)\n"
-           "  --line N         bytes fetched per random address: 16..4096 (default 64)\n"
+           "  --line N         bytes fetched per random address: 16..4096 (default 64; --steps:\n"
+           "                   the GPU cache line, 128 B on AMD / Samsung Xclipse, else 64 B)\n"
            "  --reps N         measured repetitions (default 5)\n"
            "  --warmup N       minimum warm-up repetitions per test (default 2)\n"
            "  --warmup-ms N    minimum warm-up GPU time per test (default 500)\n"
@@ -3785,7 +3795,7 @@ std::string usage() {
            "  --cpu-steps      the --steps test on the CPU cores: same data, addresses and\n"
            "                   checksums; step 6/7 = software prefetch / tuned threads x prefetch\n"
            "  --strict N       --steps / --cpu-steps read only one line per N B block, so no\n"
-           "                   cache line serves two reads (default 256; 64 = every line)\n"
+           "                   cache line serves two reads (default 256; <= line = every line)\n"
            "  --no-checks      skip the anti-optimisation checks\n"
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
@@ -3811,7 +3821,7 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--size-mb") { if (!next(v)) return false; o.sizeMB = v; }
         else if (k == "--chunk-mb") { if (!next(v)) return false; o.chunkMB = uint32_t(v); }
         else if (k == "--window-mb") { if (!next(v)) return false; o.windowMB = o.chunkMB = uint32_t(v); }
-        else if (k == "--line") { if (!next(v)) return false; o.lineBytes = uint32_t(v); }
+        else if (k == "--line") { if (!next(v)) return false; o.lineBytes = uint32_t(v); o.lineSet = true; }
         else if (k == "--reps") { if (!next(v)) return false; o.reps = int(std::max<uint64_t>(v, 1)); }
         else if (k == "--warmup") { if (!next(v)) return false; o.warmup = int(v); }
         else if (k == "--warmup-ms") { if (!next(v)) return false; o.warmupMs = double(v); }

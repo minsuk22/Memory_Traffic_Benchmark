@@ -7,13 +7,14 @@
 
 namespace mb {
 
-constexpr const char* kVersion = "1.13";
+constexpr const char* kVersion = "1.14";
 
 struct Options {
     uint64_t sizeMB    = 1024;  // total working set
     uint32_t chunkMB   = 0;     // 0 = auto (<= 256 MiB, <= device limits)
     uint32_t windowMB  = 0;     // random accesses stay inside windows of this size, one window at a time
     uint32_t lineBytes = 64;    // bytes fetched per random address (16..4096, power of 2)
+    bool     lineSet   = false; // --line given (else --steps uses the GPU cache line size)
     int      reps      = 5;
     int      warmup    = 2;     // minimum warm-up runs per test
     double   warmupMs  = 500;   // ... and minimum warm-up GPU time per test

@@ -196,6 +196,12 @@ bytes should equal the reported traffic (for 64 B lines).
   the bytes really read. The last step is also measured reading every line, for comparison.
   `--strict 128` = one line per 128 B, `--strict 64` = every line (v1.12 behaviour, with the
   1-line-per-128 B check instead).
+  **Since v1.14** the GPU steps read whole GPU cache lines: 128 B lines on AMD / Samsung
+  Xclipse (Exynos), 64 B elsewhere (`--line N` overrides). With 64 B reads in strict mode a
+  128 B line GPU fetched 128 B per read and threw half away (Exynos step 7: about -40 %
+  against v1.12, Adreno: about -10 %). Each measured run also repeats the strict pattern
+  2^spread times in one submission, so a run is as long as a full read of the set and the
+  memory clock does not drop between short runs.
 * The same steps on the CPU cores (`--cpu-steps`, `--step N` works too; app: switch
   **실행 장치 GPU ⇄ CPU** above the step buttons): host buffer with the same data, the same
   windows, random order and checksum formula; the threads split the windows, so each thread
