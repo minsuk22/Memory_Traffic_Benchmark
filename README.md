@@ -190,6 +190,9 @@ bytes should equal the reported traffic (for 64 B lines).
   checked against the CPU reference, plus the 1-line-per-128 B cache-reuse check. S22 Ultra
   (app): 1.8 / 3.4 / 26.2 / 28.4 / 29.3 / 33.6 / 33.5 GB/s = 4 % .. 75 % of seq 44.5 GB/s.
   Only step 1 is random over the whole buffer. (These numbers are v1.12, which read every line.)
+  Since v1.17 steps 2-5 are also measured with step 6's dispatch (same areas, many at once;
+  shown below the step and in the recap, the step result stays one area at a time): this
+  separates the area-size effect (GPU TLB) from the cost of waiting at every area switch.
   **Line = GPU cache line (since v1.14):** the GPU steps read whole GPU cache lines, 128 B on
   AMD / Samsung Xclipse (Exynos), 64 B elsewhere (`--line N` overrides). Every line is read
   exactly once, so no fetched cache line serves two reads and none is half wasted - the same

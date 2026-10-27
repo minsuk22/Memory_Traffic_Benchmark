@@ -3295,7 +3295,7 @@ void Bench::randTune() {
 
         struct Done {
             int i;
-            double med;
+            double med, roll = 0;  // roll: same areas, many at once (steps 2-5)
         };
         std::vector<Done> done;
         Cfg last = s0;
@@ -3335,8 +3335,21 @@ void Bench::randTune() {
             log("          -> %7.2f GB/s  = %5.1f%% of seq%s   (wg %u, lines in flight %u, %u threads)%s", p.med,
                 100.0 * p.med / seqPeak, x1 > 0 ? fmt("  x%.1f vs step 1", x1).c_str() : "", c.wg, c.unroll, p.T,
                 p.ok ? "" : "  CHECKSUM MISMATCH");
+            // Steps 2-5 also with step 6's dispatch (many areas at once): separates the effect
+            // of the area size (TLB) from that of waiting at every area switch. Only shown;
+            // the step result stays the one-area-at-a-time number.
+            double rollMed = 0;
+            if (!c.roll && c.window < chunkBytes_) {
+                Cfg rc = c;
+                rc.roll = true;
+                Pt pr = point(rc, kRand, std::max(o_.reps, 5));
+                allOk &= pr.ok;
+                rollMed = pr.med;
+                log("          same areas, many at once (as step 6): %7.2f GB/s  = %5.1f%% of seq  (%.2f x)%s", pr.med,
+                    100.0 * pr.med / seqPeak, p.med > 0 ? pr.med / p.med : 0, pr.ok ? "" : "  CHECKSUM MISMATCH");
+            }
             rows_.push_back({fmt("step %d %s", n, st.name.c_str()), p.runs, p.ok});
-            done.push_back({n, p.med});
+            done.push_back({n, p.med, rollMed});
             last = c;
             finalRand_ = {p.med, seqPeak, fmt("step %d: %s", n, st.name.c_str())};
         }
@@ -3386,6 +3399,11 @@ void Bench::randTune() {
             const double pc = 100.0 * d.med / seqPeak;
             log("  step %d %-19s %7.2f GB/s %5.1f%%  %s", d.i, steps[d.i - 1].name.c_str(), d.med, pc,
                 std::string(size_t(std::min(25.0, std::max(0.0, pc / 4))), '#').c_str());
+            if (d.roll > 0) {
+                const double pr = 100.0 * d.roll / seqPeak;
+                log("    %-23s %7.2f GB/s %5.1f%%  %s", "  + many at once", d.roll, pr,
+                    std::string(size_t(std::min(25.0, std::max(0.0, pr / 4))), '#').c_str());
+            }
         }
         if (done.size() > 1 && done[0].i == 1)
             log("  step 1 is random over the whole buffer; steps 2-7 are random only inside small areas");
