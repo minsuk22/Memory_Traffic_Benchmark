@@ -46,6 +46,8 @@ struct ReadCfg {
     uint32_t prefetch = 0;   // software prefetch distance in lines (power of two <= 256), 0 = off
     bool dependent = false;  // next address depends on the previous load (latency test)
     uint32_t spread = 0;     // line i lives at line slot i << spread (cache-line reuse check)
+    uint32_t writePct = 0;   // --mix: lines with ref::isWriteLine() are written (canonical ^ writeTag), not read
+    uint32_t writeTag = 0;
 };
 
 struct ReadResult {
@@ -57,6 +59,8 @@ struct ReadResult {
 ReadResult randRead(const Buffer& b, const ReadCfg& c);
 // Checksum the read must produce, computed from the formula (no memory reads).
 void expectedChecksum(const ReadCfg& c, uint32_t out[2]);
+// 16 B words of the first `bytes` of the buffer that differ from Buffer::fill(seedMix).
+uint64_t contentMismatches(const Buffer& b, uint64_t bytes, uint32_t seedMix, unsigned threads);
 // Transparent-huge-page mode and AnonHugePages of this process (best effort).
 std::string hugePageInfo();
 

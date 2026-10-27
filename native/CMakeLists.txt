@@ -40,7 +40,7 @@ endif()
 
 # ---- shaders -> SPIR-V (embedded as C arrays) + disassembly for inspection ----------
 set(SPV_INCS "")
-foreach(s read write copy verify gemm_tiled randmm_alu read_tune_ssbo read_tune_texel)
+foreach(s read write copy verify gemm_tiled randmm_alu read_tune_ssbo read_tune_texel read_tune_mix)
   set(src "${SHADER_DIR}/${s}.comp")
   add_custom_command(
     OUTPUT "${GEN_DIR}/${s}.spv.inc" "${GEN_DIR}/${s}.spvasm"

@@ -79,6 +79,14 @@ void readRange(const uint32_t* words, const ReadCfg& c, uint32_t chunk, uint32_t
             line = lineOf(lineL);
         }
         const uint32_t* v = base + (uint64_t(line) << c.spread) * lineWords;
+        if (c.writePct) {  // --mix: whole line written instead of read (same choice as read_tune_mix)
+            const uint32_t gw = uint32_t(v - words);
+            if (ref::isWriteLine((gw >> 2) >> c.vplShift, c.seedMix, c.writePct)) {
+                uint32_t* d = const_cast<uint32_t*>(v);
+                for (uint32_t j = 0; j < lineWords; ++j) d[j] = ref::dataValue(gw + j, c.seedMix) ^ c.writeTag;
+                continue;
+            }
+        }
         const uint32_t g = logicalBase + (lineL << c.vplShift);
         for (uint32_t s = 0; s < vpl; ++s) mix(a0, a1, v + 4u * s, g + s);
         if (DEP) dep = v[0];
@@ -191,6 +199,7 @@ void expectedChecksum(const ReadCfg& c, uint32_t out[2]) {
                 ref::Params p{(1u << c.linesBits) - 1u, c.linesBits, c.vplShift, 1u, c.seedMix, {}};
                 std::memcpy(p.keyA, c.keys[chunk].data(), sizeof p.keyA);
                 p.spreadShift = c.spread;
+                p.writePct = c.writePct;
                 const uint32_t logicalBase =
                     uint32_t(uint64_t(chunk) * (uint64_t(c.passes) << (c.linesBits + c.vplShift)));
                 ref::readChecksum(p, uint32_t(uint64_t(chunk) * c.chunkWords), logicalBase, lb << c.vplShift,
@@ -203,6 +212,29 @@ void expectedChecksum(const ReadCfg& c, uint32_t out[2]) {
         out[0] += p[0];
         out[1] += p[1];
     }
+}
+
+uint64_t contentMismatches(const Buffer& b, uint64_t bytes, uint32_t seedMix, unsigned threads) {
+    const uint64_t n = bytes / 16;
+    const unsigned nt = std::max(1u, threads);
+    std::vector<uint64_t> part(nt, 0);
+    std::vector<std::thread> th;
+    for (unsigned t = 0; t < nt; ++t)
+        th.emplace_back([&, t] {
+            const uint32_t* w = b.words();
+            uint64_t bad = 0;
+            for (uint64_t i = n * t / nt, e = n * (t + 1) / nt; i < e; ++i) {
+                bool diff = false;
+                for (uint32_t j = 0; j < 4; ++j)
+                    diff |= w[i * 4 + j] != ref::dataValue(uint32_t(i * 4 + j), seedMix);
+                bad += diff;
+            }
+            part[t] = bad;
+        });
+    for (auto& t : th) t.join();
+    uint64_t s = 0;
+    for (uint64_t p : part) s += p;
+    return s;
 }
 
 std::string hugePageInfo() {

@@ -204,6 +204,16 @@ bytes should equal the reported traffic (for 64 B lines).
   threw half away (step 7 about -40 %). Strict runs repeat the pattern 2^spread times in one
   submission, so a run is as long as a full read and the memory clock does not drop between
   short runs.
+* Random read + write (v1.16, `--mix` or `--write-pct N`, default 10 %; app: switch
+  **패턴 Read only ⇄ Read + Write** and the **write 비율 %** field): the same steps on the GPU
+  or (with `--cpu-steps`) the CPU, but a fixed random N % of the lines is written instead of
+  read. Whole lines; the choice depends only on the physical line (hash of its address), so
+  every step, kernel shape and the CPU write the same lines and read all the others. GB/s =
+  bytes read + written, the seq reference stays read only, the last line reads
+  `RANDOM R/W (N% write)`. Checks: the read checksum leaves the written lines out; written
+  lines get the fill value XOR a per-row tag, so after every row exactly the expected number
+  of 16 B words must differ from the fill (counted over the whole set), and one more run with
+  tag 0 must restore the fill completely.
 * The same steps on the CPU cores (`--cpu-steps`, `--step N` works too; app: switch
   **실행 장치 GPU ⇄ CPU** above the step buttons): host buffer with the same data, the same
   windows, random order and checksum formula; the threads split the windows, so each thread

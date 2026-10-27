@@ -9,6 +9,7 @@ struct Params {
     uint32_t linesMask, linesBits, vplShift, pattern, seedMix;
     uint32_t keyA[4];
     uint32_t spreadShift;  // read_tune SPREAD_SHIFT: line i lives at line slot i << spreadShift
+    uint32_t writePct;     // read_tune_mix WRITE_PCT: written lines are left out of the checksum
 };
 
 inline uint32_t hash32(uint32_t x) {
@@ -40,6 +41,11 @@ inline uint32_t vecIndex(const Params& p, uint32_t g, const uint32_t k[4]) {
     return (line << p.vplShift) | sub;
 }
 
+// read_tune_mix: is global line `line` written instead of read?
+inline bool isWriteLine(uint32_t line, uint32_t seedMix, uint32_t writePct) {
+    return writePct && hash32(line ^ seedMix ^ 0x6A09E667u) % 100u < writePct;
+}
+
 inline uint32_t rotl(uint32_t x, uint32_t r) { return (x << r) | (x >> (32u - r)); }
 
 inline void mixChecksum(uint32_t acc[2], const uint32_t v[4], uint32_t G) {
@@ -55,6 +61,7 @@ inline void readChecksum(const Params& p, uint32_t chunkWordBase, uint32_t logic
         if (p.spreadShift)
             vi = ((vi >> p.vplShift) << (p.vplShift + p.spreadShift)) | (vi & ((1u << p.vplShift) - 1u));
         uint32_t w  = chunkWordBase + vi * 4u;
+        if (isWriteLine((w >> 2) >> p.vplShift, p.seedMix, p.writePct)) continue;
         uint32_t v[4] = {dataValue(w, p.seedMix), dataValue(w + 1u, p.seedMix),
                          dataValue(w + 2u, p.seedMix), dataValue(w + 3u, p.seedMix)};
         mixChecksum(acc, v, logicalBase + g);

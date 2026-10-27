@@ -26,7 +26,8 @@ import java.util.List;
  *   adb shell am start -n com.memtraffic.bench/.MainActivity --es args "--size-mb 1024 --steps"
  * Menu, top to bottom: random read with the access pattern constrained step by step
  * (--steps, or one step with --step N; the GPU/CPU switch runs the same test on the CPU
- * cores with --cpu-steps), then the other measurements (normal benchmark,
+ * cores with --cpu-steps; the pattern switch adds --write-pct N for random read + write),
+ * then the other measurements (normal benchmark,
  * --rand-tune, and the diagnosis modes --peak / --cpu / --dvfs / --matrix under "Advanced").
  * The last line of every log is the random read result. "Share log" / "Copy log" hand the
  * complete output to any app; every log is also saved to Download/membench/.
@@ -52,7 +53,7 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(24, 24, 24, 24);
 
-        title(root, "Random read: 접근 범위를 한 단계씩 좁히기");
+        title(root, "Random read (/ write): 접근 범위를 한 단계씩 좁히기");
         // The step buttons run on the GPU (--steps) or, switched, the same test on the CPU
         // cores (--cpu-steps); steps 6 and 7 differ between the two.
         LinearLayout r0 = row(root);
@@ -66,6 +67,26 @@ public class MainActivity extends Activity {
         for (int s = 5; s <= 7; ++s) stepButton(r2, s);
         dev.setOnClickListener(v -> { onCpu = !onCpu; updateStepLabels(dev); });
         updateStepLabels(dev);
+        // Access pattern: random read only, or random read + write (--write-pct N, N % of the
+        // lines are written instead of read).
+        LinearLayout rm = row(root);
+        final Button pat = button(rm, "", null);
+        runButtons.add(pat);
+        TextView wl = new TextView(this);
+        wl.setText("write 비율 %");
+        wl.setTextSize(12f);
+        wl.setGravity(android.view.Gravity.CENTER);
+        rm.addView(wl, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f));
+        writePct = new EditText(this);
+        writePct.setSingleLine(true);
+        writePct.setTextSize(12f);
+        writePct.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        writePct.setText("10");
+        rm.addView(writePct, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        pat.setOnClickListener(v -> { mix = !mix; updatePattern(pat); });
+        updatePattern(pat);
+        root.removeView(rm);
+        root.addView(rm, root.indexOfChild(r1));  // right below the device switch
 
         title(root, "기타 측정");
         LinearLayout r3 = row(root);
@@ -146,7 +167,7 @@ public class MainActivity extends Activity {
 
     /** Step s (1..7), or all steps for s = 0, on the device chosen with the GPU/CPU switch. */
     private void stepButton(LinearLayout row, int s) {
-        Button b = button(row, "", v -> start(args.getText().toString() + (onCpu ? " --cpu-steps" : " --steps")
+        Button b = button(row, "", v -> start(args.getText().toString() + (onCpu ? " --cpu-steps" : " --steps") + mixArgs()
                 + (s > 0 ? " --step " + s : "")));
         stepButtons[s] = b;
         runButtons.add(b);
@@ -155,6 +176,21 @@ public class MainActivity extends Activity {
     private void updateStepLabels(Button dev) {
         dev.setText(onCpu ? "실행 장치\nCPU ⇄" : "실행 장치\nGPU ⇄");
         for (int s = 0; s < 8; ++s) stepButtons[s].setText((onCpu ? STEP_CPU : STEP_GPU)[s]);
+    }
+
+    private boolean mix = false;
+    private EditText writePct;
+
+    private void updatePattern(Button pat) {
+        pat.setText(mix ? "패턴\nRead + Write ⇄" : "패턴\nRead only ⇄");
+        writePct.setEnabled(mix);
+    }
+
+    /** " --write-pct N" in read + write mode (N from the field, 10 if empty). */
+    private String mixArgs() {
+        if (!mix) return "";
+        String n = writePct.getText().toString().trim();
+        return " --write-pct " + (n.isEmpty() ? "10" : n);
     }
 
     private void setRunning(boolean running) {

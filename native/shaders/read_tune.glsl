@@ -24,6 +24,13 @@ layout(constant_id = 3) const uint ROLL = 0u;
 // no two lines read share a 2^s-line block. Checks whether small windows are fast only
 // because the other half of a larger cache line is hit later (that would not be random).
 layout(constant_id = 4) const uint SPREAD_SHIFT = 0u;
+// WRITE_PCT (MIX_RW kernel only): a line is written instead of read if
+// hash32(global line ^ seedMix ^ salt) % 100 < WRITE_PCT. The choice depends on the physical
+// line only, so every kernel shape / window writes the same lines and reads all the others
+// (whose content never changes). A written line gets its canonical value XOR pc.mode
+// (the host's write tag): tag != 0 makes every written 16 B word differ from the fill, so
+// the host can count them afterwards (verify.comp), tag 0 restores the fill.
+layout(constant_id = 5) const uint WRITE_PCT = 0u;
 const uint NL = UNROLL * VPL;
 
 #include "common.glsl"
@@ -36,11 +43,37 @@ uint spreadIndex(uint vi) {
 #ifdef TEXEL
 layout(set = 0, binding = 2) uniform usamplerBuffer tex;
 #define LOAD(i) texelFetch(tex, int(i))
+#elif defined(MIX_RW)
+layout(std430, set = 0, binding = 0) buffer Data { uvec4 data[]; };
+#define LOAD(i) data[i]
 #else
 layout(std430, set = 0, binding = 0) readonly buffer Data { uvec4 data[]; };
 #define LOAD(i) data[i]
 #endif
 
+#ifdef MIX_RW
+uint gvBase;  // global uvec4 index of uvec4 0 of the bound chunk
+bool isWrite(uint vi) {  // vi = uvec4 index inside the chunk
+    return hash32(((gvBase + vi) >> pc.vplShift) ^ pc.seedMix ^ 0x6A09E667u) % 100u < WRITE_PCT;
+}
+uvec4 written(uint vi) {
+    uint w = (gvBase + vi) * 4u;
+    return uvec4(dataValue(w), dataValue(w + 1u), dataValue(w + 2u), dataValue(w + 3u)) ^ uvec4(pc.mode);
+}
+// Line slot k / VPL, uvec4 k % VPL of it: written (and left out of the checksum) or read.
+#define LD(k)                                                                  \
+    uvec4 v##k = uvec4(0u);                                                    \
+    uint g##k = 0u;                                                            \
+    bool r##k = false;                                                         \
+    if (k < NL) {                                                              \
+        g##k = ((it + k / VPL) * T + tid) * VPL + k % VPL;                     \
+        uint i##k = base + spreadIndex(vecIndex(g##k, key));                   \
+        r##k = !isWrite(i##k);                                                 \
+        if (r##k) v##k = LOAD(i##k);                                           \
+        else data[i##k] = written(i##k);                                       \
+    }
+#define MIX(k) if (k < NL && r##k) acc = mixChecksum(acc, v##k, lbase + g##k);
+#else
 // Load k of one iteration: line slot k / VPL, uvec4 k % VPL of it. Branches on k < NL fold
 // away after specialization, so the loads are plain registers (no private array).
 #define LD(k)                                                                  \
@@ -51,6 +84,7 @@ layout(std430, set = 0, binding = 0) readonly buffer Data { uvec4 data[]; };
         v##k = LOAD(base + spreadIndex(vecIndex(g##k, key)));                  \
     }
 #define MIX(k) if (k < NL) acc = mixChecksum(acc, v##k, lbase + g##k);
+#endif
 
 // Host deriveKey(base, w): per-window permutation key.
 uvec4 windowKey(uint b, uint w) {
@@ -71,6 +105,9 @@ void main() {
         lbase = pc.logicalBase + wl * pc.keyB.z;
         key   = windowKey(pc.keyA.x, pc.keyB.y + wl);
     }
+#ifdef MIX_RW
+    gvBase = (pc.chunkWordBase >> 2) - pc.dstVecOffset;  // chunkWordBase = chunk start + window offset
+#endif
     uvec2 acc = uvec2(0u);
 
     for (uint it = 0u; it < pc.itersPerThread; it += UNROLL) {

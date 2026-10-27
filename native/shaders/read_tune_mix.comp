@@ -1,0 +1,6 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Random read + write kernel (--mix): the storage buffer kernel of read_tune.glsl with a
+// writable buffer; WRITE_PCT % of the lines are written instead of read.
+#define MIX_RW 1
+#include "read_tune.glsl"

@@ -59,6 +59,9 @@ const uint32_t kReadTuneSsboSpv[] = {
 const uint32_t kReadTuneTexelSpv[] = {
 #include "read_tune_texel.spv.inc"
 };
+const uint32_t kReadTuneMixSpv[] = {
+#include "read_tune_mix.spv.inc"
+};
 
 // Must match the push_constant block in common.glsl (std430).
 struct Push {
@@ -2214,6 +2217,12 @@ void Bench::cpuSteps() {
     log("  %s, in random order (same addresses and data", sp ? "a block are never read, so no cache line serves two reads)"
                                                                : "no fetched cache line serves two reads");
     log("  as the GPU), checked against the checksum formula; GB/s = bytes really read");
+    if (o_.mix && o_.writePct) {
+        log("  READ + WRITE (--mix): a fixed random %u%% of the lines is WRITTEN instead of read (whole lines, the",
+            o_.writePct);
+        log("  same lines as on the GPU); GB/s = bytes read + written. After every row the written lines are");
+        log("  counted (each must have changed) and restored. Seq reference = read only.");
+    }
     freeChunks();
     cpu::Buffer buf;
     buf.allocate(bytes, false);
@@ -2242,6 +2251,7 @@ void Bench::cpuSteps() {
         c.chunkWords = uint32_t(win / 4);
         c.linesBits = log2u(win / line) - spread;
         c.spread = spread;
+        c.writePct = o_.mix ? o_.writePct : 0;  // --mix: that share of the lines is written instead of read
         c.threads = threads;
         c.prefetch = pf;
         for (uint32_t w = 0; w < bytes / win; ++w) {
@@ -2253,7 +2263,10 @@ void Bench::cpuSteps() {
     };
     bool allOk = true;
     std::map<std::array<uint64_t, 3>, std::array<uint32_t, 2>> exps;
-    auto measure1 = [&](const cpu::ReadCfg& c, int reps) {
+    std::map<uint32_t, uint64_t> wcount;  // --mix: written 16 B words per spread
+    int nMeasured = 0;
+    auto measure1 = [&](const cpu::ReadCfg& c0, int reps) {
+        cpu::ReadCfg c = c0;
         const std::array<uint64_t, 3> key = {c.chunkWords, c.linesBits, c.spread};
         if (!exps.count(key)) {
             std::array<uint32_t, 2> e;
@@ -2263,10 +2276,30 @@ void Bench::cpuSteps() {
         const auto e = exps[key];
         std::vector<double> runs;
         bool ok = true;
+        c.writeTag = c.writePct ? (ref::hash32(seedMix ^ uint32_t(++nMeasured)) | 1u) : 0u;
         for (int i = 0; i <= reps; ++i) {  // run 0 is discarded (but checked)
             cpu::ReadResult r = cpu::randRead(buf, c);
             ok &= r.chk[0] == e[0] && r.chk[1] == e[1];
             if (i) runs.push_back(double(r.lines) * line / (r.ms * 1e6));
+        }
+        if (c.writePct) {
+            // Writes: exactly the written 16 B words differ from the fill; a run with tag 0
+            // restores it completely (same check as the GPU steps).
+            if (!wcount.count(c.spread)) {
+                uint64_t n = 0;
+                for (uint64_t L = 0; L < bytes / line; L += 1u << c.spread)
+                    n += ref::isWriteLine(uint32_t(L), seedMix, c.writePct);
+                wcount[c.spread] = n * (line / 16);
+            }
+            const uint64_t want = wcount[c.spread], got = cpu::contentMismatches(buf, bytes, seedMix, nt);
+            c.writeTag = 0;
+            cpu::ReadResult r = cpu::randRead(buf, c);
+            const uint64_t left = cpu::contentMismatches(buf, bytes, seedMix, nt);
+            const bool wok = got == want && left == 0 && r.chk[0] == e[0] && r.chk[1] == e[1];
+            if (!wok)
+                log("          write check FAILED: %llu changed 16 B words (expected %llu), %llu left after restoring",
+                    (unsigned long long)got, (unsigned long long)want, (unsigned long long)left);
+            ok &= wok;
         }
         allOk &= ok;
         return std::make_pair(runs, ok);
@@ -2871,7 +2904,7 @@ void Bench::randTune() {
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::vector<VkDescriptorSet> sets;
         std::vector<VkBufferView> views;
-        std::map<std::array<uint32_t, 7>, VkPipeline> pipes;
+        std::map<std::array<uint32_t, 8>, VkPipeline> pipes;
         ~Res() {
             vkDeviceWaitIdle(d);
             for (auto& p : pipes)
@@ -2962,21 +2995,23 @@ void Bench::randTune() {
         bool texel;
         bool roll = false;     // rolling windows (one dispatch per chunk) instead of one window per dispatch
         uint32_t spread = 0;   // read one line per 2^spread line slots (cache-line reuse check)
-        auto tie() const { return std::make_tuple(threads, wg, unroll, vpl, line, sg, window, texel, roll, spread); }
+        uint32_t wpct = 0;     // --mix: % of the lines written instead of read (read_tune_mix kernel)
+        auto tie() const { return std::make_tuple(threads, wg, unroll, vpl, line, sg, window, texel, roll, spread, wpct); }
     };
 
     auto pipeFor = [&](const Cfg& c) -> VkPipeline {
-        const std::array<uint32_t, 7> k = {c.wg, c.unroll, c.vpl, c.texel ? 1u : 0u, c.sg, c.roll ? 1u : 0u, c.spread};
+        const std::array<uint32_t, 8> k = {c.wg, c.unroll, c.vpl, c.texel ? 1u : 0u, c.sg, c.roll ? 1u : 0u, c.spread,
+                                           c.wpct};
         auto it = res.pipes.find(k);
         if (it != res.pipes.end()) return it->second;
         VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smci.codeSize = c.texel ? sizeof kReadTuneTexelSpv : sizeof kReadTuneSsboSpv;
-        smci.pCode = c.texel ? kReadTuneTexelSpv : kReadTuneSsboSpv;
+        smci.codeSize = c.wpct ? sizeof kReadTuneMixSpv : c.texel ? sizeof kReadTuneTexelSpv : sizeof kReadTuneSsboSpv;
+        smci.pCode = c.wpct ? kReadTuneMixSpv : c.texel ? kReadTuneTexelSpv : kReadTuneSsboSpv;
         VkShaderModule sm;
         VK_CHECK(vkCreateShaderModule(dev_, &smci, nullptr, &sm));
-        uint32_t spec[5] = {c.wg, c.unroll, c.vpl, c.roll ? 1u : 0u, c.spread};
-        VkSpecializationMapEntry me[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}};
-        VkSpecializationInfo si{5, me, sizeof spec, spec};
+        uint32_t spec[6] = {c.wg, c.unroll, c.vpl, c.roll ? 1u : 0u, c.spread, c.wpct};
+        VkSpecializationMapEntry me[6] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}};
+        VkSpecializationInfo si{c.wpct ? 6u : 5u, me, c.wpct ? sizeof spec : 5 * sizeof(uint32_t), spec};
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rs{
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
         rs.requiredSubgroupSize = c.sg;
@@ -3015,6 +3050,7 @@ void Bench::randTune() {
     // windows. Rolling: one dispatch for all windows of a chunk (fewer if the workgroup
     // count limit is reached), a barrier only between those dispatches. passes > 1 repeats the
     // whole set inside one submission (checksums and workgroup counts add up per pass).
+    uint32_t wtag = 0;
     auto runOnce = [&](const Cfg& c, VkPipeline p, uint32_t pattern, uint32_t passes = 1) {
         uint32_t T, iters;
         shape(c, T, iters);
@@ -3040,6 +3076,7 @@ void Bench::randTune() {
                 pc.pattern = pattern;
                 pc.seedMix = curSeedMix_;
                 pc.outSlot = 0;
+                pc.mode = wtag;  // --mix: XOR tag of the written lines (read_tune_mix)
                 deriveKey(rkey, uint32_t(w), pc.keyA);
                 if (c.roll) {
                     pc.keyA[0] = rkey;
@@ -3063,9 +3100,9 @@ void Bench::randTune() {
     };
 
     // CPU reference: depends on the window, line size and pattern only (not on the shape).
-    std::map<std::array<uint64_t, 4>, std::array<uint32_t, 2>> refs;
+    std::map<std::array<uint64_t, 5>, std::array<uint32_t, 2>> refs;
     auto refFor = [&](const Cfg& c, uint32_t pattern) {
-        const std::array<uint64_t, 4> k = {c.window, c.line, pattern, c.spread};
+        const std::array<uint64_t, 5> k = {c.window, c.line, pattern, c.spread, c.wpct};
         auto it = refs.find(k);
         if (it != refs.end()) return it->second;
         const uint64_t vecs = (c.window / 16) >> c.spread, perChunk = chunkBytes_ / c.window;
@@ -3073,7 +3110,7 @@ void Bench::randTune() {
         std::array<uint32_t, 2> out;
         refChecksum(uint32_t(chunks_.size() * perChunk), vecs,
                     [&](uint32_t w, ref::Params& p, uint32_t& wordBase, uint32_t& logicalBase) {
-                        p = {(1u << lb) - 1u, lb, vs, pattern, curSeedMix_, {}, c.spread};
+                        p = {(1u << lb) - 1u, lb, vs, pattern, curSeedMix_, {}, c.spread, c.wpct};
                         deriveKey(rkey, w, p.keyA);
                         wordBase = uint32_t((w / perChunk) * (chunkBytes_ / 4) + (w % perChunk) * c.window / 4);
                         logicalBase = uint32_t(w * vecs);
@@ -3081,6 +3118,30 @@ void Bench::randTune() {
                     out.data());
         refs[k] = out;
         return out;
+    };
+
+    // --mix: 16 B words the read_tune_mix kernel writes (lines it visits that are write lines).
+    std::map<std::array<uint32_t, 3>, uint64_t> wcount;
+    auto writtenVecs = [&](uint32_t line, uint32_t spread, uint32_t wpct) {
+        const std::array<uint32_t, 3> k = {line, spread, wpct};
+        auto it = wcount.find(k);
+        if (it != wcount.end()) return it->second;
+        const uint64_t lines = setBytes / line;
+        uint64_t n = 0;
+        for (uint64_t L = 0; L < lines; L += 1u << spread) n += ref::isWriteLine(uint32_t(L), curSeedMix_, wpct);
+        return wcount[k] = n * (line / 16);
+    };
+    // 16 B words of the whole set that differ from the fill (verify.comp).
+    auto contentMismatches = [&] {
+        Job v;
+        v.pipe = pVerify_;
+        v.linesBits = chunkLinesBits_;
+        v.pattern = kSeq;
+        v.seedMix = curSeedMix_;
+        v.numChunks = uint32_t(chunks_.size());
+        v.unroll = 1;
+        JobResult r = execute(v);
+        return r.wgDone == r.wgExpected ? r.chkX : ~0u;
     };
 
     struct Pt {
@@ -3102,10 +3163,26 @@ void Bench::randTune() {
         // Strict mode reads 1 / 2^spread of the set: that many passes per run keep a run as
         // long as a full read, so short runs do not leave the memory clock behind.
         const uint32_t passes = 1u << c.spread;
+        wtag = c.wpct ? (ref::hash32(curSeedMix_ ^ uint32_t(mismatches + 77)) | 1u) : 0u;
         for (int i = 0; i <= reps; ++i) {  // run 0 is discarded (but checked)
             JobResult r = runOnce(c, p, pattern, passes);
             pt.ok &= r.chkX == passes * ref[0] && r.chkY == passes * ref[1] && r.wgDone == r.wgExpected;
             if (i) pt.runs.push_back(double(passes * (setBytes >> c.spread)) / (r.ms() * 1e6));
+        }
+        if (c.wpct) {
+            // Writes: every written 16 B word must now differ from the fill (tag != 0), and
+            // exactly those; one more run with tag 0 must restore the fill completely.
+            const uint64_t want = writtenVecs(c.line, c.spread, c.wpct);
+            const uint32_t got = contentMismatches();
+            wtag = 0;
+            JobResult r = runOnce(c, p, pattern, 1);
+            const uint32_t left = contentMismatches();
+            const bool wok = got == want && left == 0 && r.wgDone == r.wgExpected && r.chkX == ref[0] &&
+                             r.chkY == ref[1];
+            if (!wok)
+                log("  write check FAILED: %u changed 16 B words (expected %llu), %u left after restoring", got,
+                    (unsigned long long)want, left);
+            pt.ok &= wok;
         }
         pt.ran = true;
         pt.med = median(pt.runs);
@@ -3137,6 +3214,12 @@ void Bench::randTune() {
             o_.strictBytes > line0 ? "of a block are never read, so no cache line can serve two reads)"
                                    : "no fetched cache line serves two reads or is wasted");
         log("  only WHERE the random addresses may fall is limited, one step at a time");
+        if (o_.mix && o_.writePct) {
+            log("  READ + WRITE (--mix): a fixed random %u%% of the lines is WRITTEN instead of read (whole lines,",
+                o_.writePct);
+            log("  same addresses in every step); GB/s = bytes read + written. After every row the written lines");
+            log("  are counted on the GPU (each must have changed) and restored. Seq reference = read only.");
+        }
     } else {
         log("[RAND TUNE] random read inside a TLB-sized window: which kernel / dispatch shape is fastest?");
         log("  every row: whole %llu MiB set, one dispatch per window, every run checked against the CPU reference",
@@ -3181,6 +3264,7 @@ void Bench::randTune() {
         Cfg s0 = base;
         s0.threads = 1u << 20;
         s0.spread = log2u(o_.strictBytes / s0.line);  // strict: one line per --strict block
+        s0.wpct = o_.mix ? o_.writePct : 0;  // --mix: that share of the lines is written instead of read
         std::vector<Step> steps;
         {
             Cfg c = s0;
@@ -3688,7 +3772,7 @@ int Bench::summary() {
     }
     if (f.gbps > 0) {
         log("");
-        log("RANDOM READ  %.2f GB/s%s  [%s]", f.gbps,
+        log("%s  %.2f GB/s%s  [%s]", o_.mix && o_.writePct ? fmt("RANDOM R/W (%u%% write)", o_.writePct).c_str() : "RANDOM READ", f.gbps,
             f.seq > 0 ? fmt("  = %.1f%% of seq %.2f GB/s", 100.0 * f.gbps / f.seq, f.seq).c_str() : "", f.what.c_str());
     }
     return fails ? 1 : 0;
@@ -3799,6 +3883,9 @@ std::string usage() {
            "                   checksums; step 6/7 = software prefetch / tuned threads x prefetch\n"
            "  --strict N       --steps / --cpu-steps read only one line per N B block, so no\n"
            "                   cache line serves two reads (default: every line, see README)\n"
+           "  --mix            --steps / --cpu-steps as random read + write: a fixed random\n"
+           "                   --write-pct % of the lines is written instead of read (alone: GPU)\n"
+           "  --write-pct N    write share of --mix in % (default 10, implies --mix)\n"
            "  --no-checks      skip the anti-optimisation checks\n"
            "  --no-cpu-ref     skip CPU reference checksums (faster)\n"
            "  --seed N         data/address seed (default random)\n"
@@ -3850,6 +3937,13 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
         else if (k == "--rand-tune") o.randTune = true;
         else if (k == "--steps") o.steps = o.randTune = true;
         else if (k == "--cpu-steps") o.cpuSteps = true;
+        else if (k == "--mix") o.mix = true;
+        else if (k == "--write-pct") {
+            if (!next(v)) return false;
+            if (v > 100) { err = "--write-pct must be 0..100"; return false; }
+            o.mix = true;
+            o.writePct = uint32_t(v);
+        }
         else if (k == "--strict") {
             if (!next(v)) return false;
             if (!isPow2(v) || v > 4096) { err = "--strict must be a power of 2 <= 4096 (<= line = every line)"; return false; }
@@ -3886,6 +3980,8 @@ bool parseArgs(const std::vector<std::string>& a, Options& o, std::string& err) 
             return false;
         }
     }
+    // --mix / --write-pct alone: the GPU steps
+    if (o.mix && !o.cpuSteps) o.steps = o.randTune = true;
     return true;
 }
 
